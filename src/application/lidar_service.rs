@@ -1,0 +1,142 @@
+use crate::domain::models::CallbackEvent;
+use crate::infrastructure::lidar_codec::{bits_to_points, decompress_lz4};
+use crossbeam_channel::{bounded, Sender, TrySendError};
+use serde_json::Value;
+use std::sync::Arc;
+use std::thread;
+use tracing::warn;
+
+pub struct LidarDecodeRequest {
+    pub topic: String,
+    pub payload: Value,
+    pub compressed_data: Vec<u8>,
+    pub metadata: LidarMetadata,
+}
+
+pub struct LidarMetadata {
+    pub origin: [f64; 3],
+    pub resolution: f64,
+    pub src_size: usize,
+}
+
+impl LidarMetadata {
+    pub fn from_json(data: &Value) -> Option<Self> {
+        let data_obj = data.as_object()?;
+        let origin_array = data_obj.get("origin")?.as_array()?;
+
+        let origin = [
+            origin_array.get(0)?.as_f64()?,
+            origin_array.get(1)?.as_f64()?,
+            origin_array.get(2)?.as_f64()?,
+        ];
+
+        let resolution = data.get("resolution")?.as_f64()?;
+        let src_size = data.get("src_size")?.as_u64()? as usize;
+
+        Some(Self {
+            origin,
+            resolution,
+            src_size,
+        })
+    }
+}
+
+pub struct LidarWorkerPool {
+    request_tx: Sender<LidarDecodeRequest>,
+}
+
+impl LidarWorkerPool {
+    pub fn new(callback_events_tx: Sender<CallbackEvent>, worker_count: usize) -> Self {
+        let (request_tx, request_rx) = bounded::<LidarDecodeRequest>(64);
+
+        for worker_id in 0..worker_count {
+            let rx = request_rx.clone();
+            let callback_tx = callback_events_tx.clone();
+
+            thread::Builder::new()
+                .name(format!("unitree-lidar-worker-{worker_id}"))
+                .spawn(move || {
+                    while let Ok(req) = rx.recv() {
+                        match Self::decode_lidar(&req) {
+                            Ok(points) => {
+                                let event = CallbackEvent::LidarCallback {
+                                    topic: req.topic,
+                                    payload: req.payload,
+                                    points,
+                                };
+
+                                if let Err(error) = callback_tx.try_send(event) {
+                                    match error {
+                                        TrySendError::Full(_) => {
+                                            warn!(
+                                                event = "lidar_callback_drop",
+                                                worker = worker_id,
+                                                reason = "callback_queue_full",
+                                                "Dropped LiDAR callback due to backpressure"
+                                            );
+                                        }
+                                        TrySendError::Disconnected(_) => {
+                                            warn!(
+                                                event = "lidar_callback_drop",
+                                                worker = worker_id,
+                                                reason = "callback_dispatcher_disconnected",
+                                                "Dropped LiDAR callback because dispatcher unavailable"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    event = "lidar_decode_failed",
+                                    worker = worker_id,
+                                    topic = req.topic,
+                                    error = %error,
+                                    "Failed to decode LiDAR data"
+                                );
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn lidar worker thread");
+        }
+
+        Self { request_tx }
+    }
+
+    pub fn submit(&self, request: LidarDecodeRequest) -> Result<(), String> {
+        self.request_tx.try_send(request).map_err(|e| match e {
+            TrySendError::Full(_) => "LiDAR worker queue full".to_string(),
+            TrySendError::Disconnected(_) => "LiDAR workers disconnected".to_string(),
+        })
+    }
+
+    fn decode_lidar(req: &LidarDecodeRequest) -> Result<Vec<f64>, String> {
+        let decompressed = decompress_lz4(&req.compressed_data, req.metadata.src_size)?;
+
+        if decompressed.len() != req.metadata.src_size {
+            return Err(format!(
+                "Decompressed size {} != expected {}",
+                decompressed.len(),
+                req.metadata.src_size
+            ));
+        }
+
+        // bits_to_points now returns Vec<f64> directly (no conversion needed!)
+        let points = bits_to_points(&decompressed, &req.metadata.origin, req.metadata.resolution);
+
+        Ok(points)
+    }
+}
+
+impl Clone for LidarWorkerPool {
+    fn clone(&self) -> Self {
+        Self {
+            request_tx: self.request_tx.clone(),
+        }
+    }
+}
+
+pub fn create_worker_pool(callback_events_tx: Sender<CallbackEvent>) -> Arc<LidarWorkerPool> {
+    Arc::new(LidarWorkerPool::new(callback_events_tx, 2))
+}
