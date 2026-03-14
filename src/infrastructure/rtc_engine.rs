@@ -1,7 +1,7 @@
-use crate::application::audio_service::spawn_audio_handler;
-use crate::application::video_service::spawn_video_handler;
-use crate::domain::models::{CallbackEvent, DcMessage};
-use crate::domain::ports::{DataChannelPort, PortResult, RtcEnginePort};
+use crate::audio::spawn_audio_handler;
+use crate::protocol::models::{CallbackEvent, DcMessage};
+use crate::protocol::ports::{DataChannelPort, PortResult, RtcEnginePort};
+use crate::video::spawn_video_handler;
 use bytes::Bytes;
 use crossbeam_channel::{Sender, TrySendError};
 use serde_json::Value;

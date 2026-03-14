@@ -1,8 +1,8 @@
-use crate::application::lidar_service::{LidarDecodeRequest, LidarMetadata, LidarWorkerPool};
-use crate::domain::models::{CallbackEvent, DcMessage, RequestIdentity};
-use crate::domain::ports::{DataChannelPort, PortResult};
+use crate::datachannel::lidar::{LidarDecodeRequest, LidarMetadata, LidarWorkerPool};
 use crate::infrastructure::security::encrypt_key;
-use crate::interface::constants::data_channel_type;
+use crate::protocol::constants::data_channel_type;
+use crate::protocol::models::{CallbackEvent, DcMessage, RequestIdentity};
+use crate::protocol::ports::{DataChannelPort, PortResult};
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde_json::{json, Map, Value};
@@ -1068,9 +1068,12 @@ fn should_emit_error_log(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::models::DcMessage;
-    use crate::domain::ports::DataChannelPort;
+    use crate::protocol::models::{CallbackEvent, DcMessage};
+    use crate::protocol::ports::{DataChannelPort, PortResult};
     use crossbeam_channel::bounded;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct MockDataChannel {
@@ -1106,7 +1109,7 @@ mod tests {
         // frame over the DataChannel — this is the send path that publish_request shares.
         let (_dc_tx, dc_rx) = bounded::<DcMessage>(32);
         let (callback_tx, _callback_rx) = bounded::<CallbackEvent>(32);
-        let lidar_pool = crate::application::lidar_service::create_worker_pool(callback_tx.clone());
+        let lidar_pool = crate::datachannel::lidar::create_worker_pool(callback_tx.clone());
         let channel = Arc::new(MockDataChannel {
             state: "open",
             sent: Arc::new(Mutex::new(Vec::new())),
@@ -1161,7 +1164,7 @@ mod tests {
     ) {
         let (dc_tx, dc_rx) = bounded::<DcMessage>(64);
         let (cb_tx, cb_rx) = bounded::<CallbackEvent>(64);
-        let lidar_pool = crate::application::lidar_service::create_worker_pool(cb_tx.clone());
+        let lidar_pool = crate::datachannel::lidar::create_worker_pool(cb_tx.clone());
         let channel = Arc::new(MockDataChannel {
             state,
             sent: Arc::new(Mutex::new(Vec::new())),

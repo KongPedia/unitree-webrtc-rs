@@ -1,6 +1,6 @@
-use crate::domain::models::CallbackEvent;
-use crate::infrastructure::h264_rtp::H264RtpReassembler;
-use crate::infrastructure::video_codec::H264Decoder;
+use super::codec::H264Decoder;
+use super::h264_rtp::H264RtpReassembler;
+use crate::protocol::models::CallbackEvent;
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 use tracing::{info, warn};

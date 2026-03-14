@@ -1,5 +1,5 @@
-use crate::domain::models::CallbackEvent;
-use crate::infrastructure::lidar_codec::{bits_to_points, decompress_lz4};
+use super::codec::{bits_to_points, decompress_lz4};
+use crate::protocol::models::CallbackEvent;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use serde_json::Value;
 use std::sync::Arc;
