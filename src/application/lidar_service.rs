@@ -140,3 +140,123 @@ impl Clone for LidarWorkerPool {
 pub fn create_worker_pool(callback_events_tx: Sender<CallbackEvent>) -> Arc<LidarWorkerPool> {
     Arc::new(LidarWorkerPool::new(callback_events_tx, 2))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use serde_json::json;
+
+    // ── LidarMetadata ─────────────────────────────────────────────────────────
+
+    /// Valid JSON with origin, resolution, src_size parses successfully.
+    #[test]
+    fn lidar_metadata_parses_valid_json() {
+        let data = json!({
+            "origin": [-5.12, -5.12, -0.64],
+            "resolution": 0.04,
+            "src_size": 131072
+        });
+        let meta = LidarMetadata::from_json(&data).expect("should parse");
+        assert_eq!(meta.origin, [-5.12, -5.12, -0.64]);
+        assert!((meta.resolution - 0.04).abs() < 1e-9);
+        assert_eq!(meta.src_size, 131072);
+    }
+
+    /// Missing any required field returns None.
+    #[test]
+    fn lidar_metadata_returns_none_on_missing_fields() {
+        // missing src_size
+        let missing_src = json!({"origin": [0.0, 0.0, 0.0], "resolution": 0.04});
+        assert!(LidarMetadata::from_json(&missing_src).is_none());
+
+        // missing origin
+        let missing_origin = json!({"resolution": 0.04, "src_size": 1024});
+        assert!(LidarMetadata::from_json(&missing_origin).is_none());
+
+        // empty object
+        assert!(LidarMetadata::from_json(&json!({})).is_none());
+    }
+
+    // ── LidarWorkerPool ───────────────────────────────────────────────────────
+
+    /// Submitting a synthetic 1-bit buffer produces xyz triplets via the worker pool.
+    #[test]
+    fn worker_pool_decodes_single_bit_to_xyz_triplet() {
+        let (cb_tx, cb_rx) = bounded::<CallbackEvent>(8);
+        let pool = create_worker_pool(cb_tx);
+
+        // Use lidar_codec::bits_to_points directly to know expected output
+        let mut decompressed = vec![0u8; 3];
+        decompressed[0] = 0b0000_0001; // bit 7 of byte 0 → x=7, y=0, z=0
+        let origin = [0.0f64, 0.0, 0.0];
+        let resolution = 0.05;
+
+        // We need to produce the compressed form that decompresses to `decompressed`.
+        // lz4_flex's block format: just use the raw bytes as content via uncompressed sentinel.
+        // Instead, submit directly using the internal decode_lidar by crafting a request
+        // where compressed_data decompresses to our known buffer.
+        let compressed = lz4_flex::block::compress(&decompressed);
+
+        let req = LidarDecodeRequest {
+            topic: "rt/utlidar/voxel_map_compressed".to_string(),
+            payload: json!({"data": {}}),
+            compressed_data: compressed,
+            metadata: LidarMetadata {
+                origin,
+                resolution,
+                src_size: 3,
+            },
+        };
+
+        pool.submit(req).expect("submit should succeed");
+
+        // Wait for the worker thread to decode and emit callback
+        let event = cb_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected LidarCallback within 2s");
+
+        match event {
+            CallbackEvent::LidarCallback {
+                topic,
+                points,
+                payload: _,
+            } => {
+                assert_eq!(topic, "rt/utlidar/voxel_map_compressed");
+                // bit 0 of byte 0 (MSB of first byte, value 0b0000_0001 → bit 7 zero-indexed from MSB is at position 0)
+                // bits_to_points: x = (n_slice % 0x10) * 8 + bit_offset = 0*8+7 = 7
+                // y = n_slice / 0x10 = 0, z = byte_index / 0x800 = 0
+                // px = 7 * 0.05 + 0.0 = 0.35
+                assert_eq!(points.len(), 3, "should produce one xyz triplet");
+                assert!((points[0] - 0.35).abs() < 1e-9, "x = 7 * 0.05 = 0.35");
+                assert!((points[1] - 0.0).abs() < 1e-9, "y = 0");
+                assert!((points[2] - 0.0).abs() < 1e-9, "z = 0");
+            }
+            other => panic!("Expected LidarCallback, got {:?}", other),
+        }
+    }
+
+    /// Worker pool submit() correctly accepts valid requests.
+    #[test]
+    fn worker_pool_submit_accepts_valid_requests() {
+        let (cb_tx, _cb_rx) = bounded::<CallbackEvent>(8);
+        let pool = create_worker_pool(cb_tx);
+
+        let data = vec![0u8; 3];
+        let compressed = lz4_flex::block::compress(&data);
+
+        let req = LidarDecodeRequest {
+            topic: "rt/utlidar/voxel_map_compressed".to_string(),
+            payload: json!({}),
+            compressed_data: compressed,
+            metadata: LidarMetadata {
+                origin: [0.0; 3],
+                resolution: 0.05,
+                src_size: 3,
+            },
+        };
+
+        let result = pool.submit(req);
+        assert!(result.is_ok(), "valid request should be accepted");
+    }
+}

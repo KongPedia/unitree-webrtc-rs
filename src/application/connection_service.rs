@@ -308,4 +308,48 @@ mod tests {
 
         assert!(!result);
     }
+
+    // ── Remote connection ──────────────────────────────────────────────────
+
+    /// Remote connection method returns "not implemented" error.
+    #[tokio::test]
+    async fn remote_connection_returns_not_implemented_error() {
+        let signaling = Arc::new(MockSignaling::default());
+        let engine = Arc::new(MockEngine::default());
+        let service =
+            ConnectionService::new(signaling, engine, WebRTCConnectionMethod::Remote, None);
+
+        let result = service.connect().await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not implemented"));
+    }
+
+    // ── reconnect ──────────────────────────────────────────────────────────
+
+    /// reconnect closes engine then reconnects, answer_history has 2 entries.
+    #[tokio::test]
+    async fn reconnect_closes_then_reconnects() {
+        let signaling = Arc::new(MockSignaling::default());
+        let engine = Arc::new(MockEngine::default());
+        let service = ConnectionService::new(
+            signaling.clone(),
+            engine.clone(),
+            WebRTCConnectionMethod::LocalSTA,
+            Some("10.0.0.1".to_string()),
+        );
+
+        service.connect().await.unwrap();
+        assert_eq!(engine.answer_history.lock().unwrap().len(), 1);
+
+        service.reconnect().await.unwrap();
+
+        assert_eq!(*engine.closed_count.lock().unwrap(), 1, "should close once");
+        assert_eq!(
+            engine.answer_history.lock().unwrap().len(),
+            2,
+            "should have 2 answers"
+        );
+        assert!(service.is_connected());
+    }
 }

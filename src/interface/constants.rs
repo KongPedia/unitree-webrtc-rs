@@ -258,3 +258,94 @@ pub fn audio_api() -> &'static BTreeMap<&'static str, i32> {
         ])
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RTC topic keys ────────────────────────────────────────────────────────
+
+    /// All topics used in Python examples must exist in rtc_topic().
+    /// Checked against sport_mode.py, lidar_stream.py, integration.py, etc.
+    #[test]
+    fn rtc_topic_contains_all_example_topics() {
+        let topics = rtc_topic();
+
+        // sport_mode.py
+        assert!(topics.contains_key("SPORT_MOD"), "SPORT_MOD missing");
+        assert!(
+            topics.contains_key("MOTION_SWITCHER"),
+            "MOTION_SWITCHER missing"
+        );
+
+        // sport_mode_state.py
+        assert!(
+            topics.contains_key("LF_SPORT_MOD_STATE"),
+            "LF_SPORT_MOD_STATE missing"
+        );
+
+        // integration.py
+        assert!(topics.contains_key("LOW_STATE"), "LOW_STATE missing");
+
+        // lidar_stream.py (subscribe to rt/utlidar/voxel_map_compressed)
+        assert!(topics.contains_key("ULIDAR_ARRAY"), "ULIDAR_ARRAY missing");
+        assert!(
+            topics.contains_key("ULIDAR_SWITCH"),
+            "ULIDAR_SWITCH missing"
+        );
+
+        // audio hub (audio_receive.py)
+        assert!(
+            topics.contains_key("AUDIO_HUB_REQ"),
+            "AUDIO_HUB_REQ missing"
+        );
+    }
+
+    /// Key RTC topic values match the string literals used in Python examples.
+    #[test]
+    fn rtc_topic_values_match_python_examples() {
+        let topics = rtc_topic();
+        assert_eq!(topics["SPORT_MOD"], "rt/api/sport/request");
+        assert_eq!(topics["MOTION_SWITCHER"], "rt/api/motion_switcher/request");
+        assert_eq!(topics["LF_SPORT_MOD_STATE"], "rt/lf/sportmodestate");
+        assert_eq!(topics["LOW_STATE"], "rt/lf/lowstate");
+    }
+
+    // ── Sport command IDs ─────────────────────────────────────────────────────
+
+    /// SPORT_CMD values must match the IDs hard-coded in sport_mode.py and integration.py.
+    #[test]
+    fn sport_cmd_ids_match_python_examples() {
+        let cmds = sport_cmd();
+        assert_eq!(cmds["StandUp"], 1004, "StandUp");
+        assert_eq!(cmds["RecoveryStand"], 1006, "RecoveryStand");
+        assert_eq!(cmds["Hello"], 1016, "Hello");
+        assert_eq!(cmds["FrontFlip"], 1030, "FrontFlip");
+        assert_eq!(cmds["StandDown"], 1005, "StandDown");
+        assert_eq!(cmds["GetState"], 1034, "GetState");
+        // integration.py
+        assert_eq!(cmds["Damp"], 1001, "Damp");
+        assert_eq!(cmds["BalanceStand"], 1002, "BalanceStand");
+    }
+
+    // ── WebRTCConnectionMethod ────────────────────────────────────────────────
+
+    /// TryFrom<i32> must parse all valid discriminants.
+    #[test]
+    fn connection_method_try_from_i32() {
+        assert_eq!(
+            WebRTCConnectionMethod::try_from(1).unwrap(),
+            WebRTCConnectionMethod::LocalAP
+        );
+        assert_eq!(
+            WebRTCConnectionMethod::try_from(2).unwrap(),
+            WebRTCConnectionMethod::LocalSTA
+        );
+        assert_eq!(
+            WebRTCConnectionMethod::try_from(3).unwrap(),
+            WebRTCConnectionMethod::Remote
+        );
+        assert!(WebRTCConnectionMethod::try_from(0).is_err());
+        assert!(WebRTCConnectionMethod::try_from(4).is_err());
+    }
+}
