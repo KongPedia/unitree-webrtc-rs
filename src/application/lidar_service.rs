@@ -25,7 +25,7 @@ impl LidarMetadata {
         let origin_array = data_obj.get("origin")?.as_array()?;
 
         let origin = [
-            origin_array.get(0)?.as_f64()?,
+            origin_array.first()?.as_f64()?,
             origin_array.get(1)?.as_f64()?,
             origin_array.get(2)?.as_f64()?,
         ];

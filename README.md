@@ -73,10 +73,11 @@ Rust-owned WebRTC transport layer for **Unitree Go2** robots, exposed to Python 
 
 | Dependency | Install |
 |---|---|
+| **GLib / GObject** | `brew install glib` (macOS) / `apt install libglib2.0-dev` (Ubuntu/Jetson) |
 | **GStreamer 1.20+** | `brew install gstreamer` (macOS) / `apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav` (Ubuntu/Jetson) |
 | **pkg-config** | `brew install pkg-config` / `apt install pkg-config` |
 | **OpenSSL** | Usually pre-installed; `apt install libssl-dev` if missing |
-| **Rust toolchain** | [rustup.rs](https://rustup.rs) (1.75+) |
+| **Rust toolchain** | Auto-selected by `rust-toolchain.toml` (currently `1.92.0`). Install rustup from [rustup.rs](https://rustup.rs). |
 
 ### Python
 
@@ -89,30 +90,34 @@ Rust-owned WebRTC transport layer for **Unitree Go2** robots, exposed to Python 
 
 ## Development Setup
 
+### One-command bootstrap (recommended)
+
 ```bash
-# 1. Navigate to this directory
-cd src/third_party/unitree-webrtc-rs
+# from repository root
+make bootstrap
+```
 
-# 2. Create & activate virtual environment (uv recommended)
-uv venv
-source .venv/bin/activate
+`make bootstrap` runs all of the following:
 
-# 3. Install Python dependencies
-uv pip install -e ".[dev]"
+- `make doctor` — checks required local tools and system libraries (`uv`, `cargo`, `pkg-config`, `glib-2.0`, `gobject-2.0`, `gstreamer-1.0`)
+- `make init` — `uv sync --dev` + `uv run maturin develop`
+- `make check` — Rust format/lint/type checks
+- `make test` — runs `pytest` when `tests/` exists
 
-# 4. Build the Rust extension into the venv
-maturin develop
+### Individual commands
 
-# 5. Verify the import
-python -c "from unitree_webrtc_rs import UnitreeWebRTCConnection, RTC_TOPIC, SPORT_CMD; print('OK')"
+```bash
+make doctor     # prerequisite checks
+make init       # uv sync + maturin develop
+make build      # rebuild python extension
+make check      # cargo fmt/clippy/check
+make test       # uv run pytest -q
 ```
 
 ### Build Verification (Rust side)
 
 ```bash
-cargo fmt                                                    # format
-cargo clippy --all-targets --all-features -- -D warnings     # lint (0 warnings required)
-cargo check --tests                                          # type-check tests
+make check
 ```
 
 > **Note:** `cargo test` may fail on macOS ARM64 due to PyO3 linker issues. Use `cargo check --tests` as a substitute. Full test suite runs on Linux/Jetson.

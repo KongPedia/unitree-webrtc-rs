@@ -459,25 +459,24 @@ fn bind_data_channel_handlers(
                         }
                     }
                 }
-            } else {
-                if let Err(error) = incoming_tx.try_send(DcMessage::Binary(message.data.to_vec())) {
-                    match error {
-                        TrySendError::Full(_) => {
-                            warn!(
-                                event = "dc_incoming_drop",
-                                payload_kind = "binary",
-                                reason = "incoming_queue_full",
-                                "Dropped binary datachannel payload due to backpressure"
-                            );
-                        }
-                        TrySendError::Disconnected(_) => {
-                            warn!(
-                                event = "dc_incoming_drop",
-                                payload_kind = "binary",
-                                reason = "incoming_queue_disconnected",
-                                "Dropped binary datachannel payload because receiver is unavailable"
-                            );
-                        }
+            } else if let Err(error) = incoming_tx.try_send(DcMessage::Binary(message.data.to_vec()))
+            {
+                match error {
+                    TrySendError::Full(_) => {
+                        warn!(
+                            event = "dc_incoming_drop",
+                            payload_kind = "binary",
+                            reason = "incoming_queue_full",
+                            "Dropped binary datachannel payload due to backpressure"
+                        );
+                    }
+                    TrySendError::Disconnected(_) => {
+                        warn!(
+                            event = "dc_incoming_drop",
+                            payload_kind = "binary",
+                            reason = "incoming_queue_disconnected",
+                            "Dropped binary datachannel payload because receiver is unavailable"
+                        );
                     }
                 }
             }
