@@ -19,15 +19,15 @@ jobs:
         python-version: ['3.10', '3.11', '3.12']
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           version: "latest"
       
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       
@@ -50,7 +50,7 @@ jobs:
           brew install gstreamer gst-plugins-base opus pkg-config
       
       - name: Cache Rust dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -68,7 +68,7 @@ jobs:
           uv run maturin build --release --out dist
       
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
           path: dist/*.whl
@@ -86,7 +86,7 @@ jobs:
     
     steps:
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
@@ -99,5 +99,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          attestations: false
           # Use PyPI API token from GitHub secrets
           password: ${{ secrets.PYPI_API_TOKEN }}
