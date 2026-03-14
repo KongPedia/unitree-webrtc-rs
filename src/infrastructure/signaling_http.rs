@@ -1,8 +1,8 @@
-use crate::domain::ports::{PortResult, SignalingPort};
 use crate::infrastructure::security::{
     aes_ecb_decrypt, aes_ecb_encrypt, decrypt_con_notify_data, generate_aes_key, rsa_encrypt,
     rsa_load_public_key,
 };
+use crate::protocol::ports::{PortResult, SignalingPort};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use reqwest::Client;

@@ -38,6 +38,7 @@ pub struct H264Decoder {
     appsrc: gst_app::AppSrc,
     frame_rx: Receiver<DecodedFrame>,
     annexb_buffer: Vec<u8>,
+    #[allow(dead_code)]
     decoder_name: String,
 }
 
@@ -177,6 +178,7 @@ impl H264Decoder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn decoder_name(&self) -> &str {
         &self.decoder_name
     }

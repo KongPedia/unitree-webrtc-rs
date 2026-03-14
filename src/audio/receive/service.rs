@@ -1,5 +1,5 @@
-use crate::domain::models::CallbackEvent;
-use crate::infrastructure::audio_codec::OpusDecoder;
+use super::codec::OpusDecoder;
+use crate::protocol::models::CallbackEvent;
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 use tracing::{info, warn};

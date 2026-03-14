@@ -1,8 +1,8 @@
-use crate::application::lidar_service::{LidarDecodeRequest, LidarMetadata, LidarWorkerPool};
-use crate::domain::models::{CallbackEvent, DcMessage, RequestIdentity};
-use crate::domain::ports::{DataChannelPort, PortResult};
+use crate::datachannel::lidar::{LidarDecodeRequest, LidarMetadata, LidarWorkerPool};
 use crate::infrastructure::security::encrypt_key;
-use crate::interface::constants::data_channel_type;
+use crate::protocol::constants::data_channel_type;
+use crate::protocol::models::{CallbackEvent, DcMessage, RequestIdentity};
+use crate::protocol::ports::{DataChannelPort, PortResult};
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde_json::{json, Map, Value};
@@ -1068,9 +1068,12 @@ fn should_emit_error_log(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::models::DcMessage;
-    use crate::domain::ports::DataChannelPort;
+    use crate::protocol::models::{CallbackEvent, DcMessage};
+    use crate::protocol::ports::{DataChannelPort, PortResult};
     use crossbeam_channel::bounded;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct MockDataChannel {
@@ -1100,34 +1103,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn publish_request_builds_payload() {
-        let (tx, rx) = bounded::<DcMessage>(32);
+    #[test]
+    fn publish_request_builds_payload() {
+        // Verify that publish_without_callback produces a correctly-shaped outgoing "msg"
+        // frame over the DataChannel — this is the send path that publish_request shares.
+        let (_dc_tx, dc_rx) = bounded::<DcMessage>(32);
         let (callback_tx, _callback_rx) = bounded::<CallbackEvent>(32);
-        let lidar_pool = crate::application::lidar_service::create_worker_pool(callback_tx.clone());
+        let lidar_pool = crate::datachannel::lidar::create_worker_pool(callback_tx.clone());
         let channel = Arc::new(MockDataChannel {
             state: "open",
             sent: Arc::new(Mutex::new(Vec::new())),
         });
 
-        let service = DataChannelService::new(channel.clone(), rx, callback_tx, lidar_pool, false);
-        let request_type = dc_types().request;
+        let service =
+            DataChannelService::new(channel.clone(), dc_rx, callback_tx, lidar_pool, false);
 
-        let pending_key = format!("{} $ {}", request_type, "rt/test");
-        {
-            let mut pending = service.pending_callbacks.lock().unwrap();
-            let (sx, _rx_done) = oneshot::channel::<Value>();
-            pending.insert(pending_key, vec![sx]);
-        }
-
-        let _ = tx.send(DcMessage::Text(
-            json!({"type": request_type, "topic": "rt/test"}).to_string(),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // publish_without_callback is the simplest form of the send path
+        service
+            .publish_without_callback("rt/api/sport/request", Some(json!({"api_id":1016})), None)
+            .expect("should succeed");
 
         let sent = channel.sent.lock().unwrap();
-        assert!(sent.iter().any(|entry| entry.contains("\"type\":\"req\"")));
+        assert!(!sent.is_empty(), "expected at least one message");
+        let frame: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(frame["type"], dc_types().msg);
+        assert_eq!(frame["topic"], "rt/api/sport/request");
     }
 
     #[test]
@@ -1148,5 +1148,599 @@ mod tests {
         });
 
         assert!(should_emit_error_log(&message));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Helper: creates a DataChannelService with a MockDataChannel and returns
+    // all channels needed for test assertions.
+    // ─────────────────────────────────────────────────────────────────────────
+    fn make_service(
+        state: &'static str,
+    ) -> (
+        DataChannelService<MockDataChannel>,
+        Arc<MockDataChannel>,
+        crossbeam_channel::Sender<DcMessage>,
+        crossbeam_channel::Receiver<CallbackEvent>,
+    ) {
+        let (dc_tx, dc_rx) = bounded::<DcMessage>(64);
+        let (cb_tx, cb_rx) = bounded::<CallbackEvent>(64);
+        let lidar_pool = crate::datachannel::lidar::create_worker_pool(cb_tx.clone());
+        let channel = Arc::new(MockDataChannel {
+            state,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let service =
+            DataChannelService::new(Arc::clone(&channel), dc_rx, cb_tx, lidar_pool, false);
+        (service, channel, dc_tx, cb_rx)
+    }
+
+    // ── subscribe ─────────────────────────────────────────────────────────────
+
+    /// subscribe() sends a json subscribe message over the data channel.
+    #[test]
+    fn subscribe_sends_subscribe_message() {
+        let (service, channel, _dc_tx, _cb_rx) = make_service("open");
+        service
+            .subscribe("rt/lf/sportmodestate")
+            .expect("subscribe should succeed");
+
+        let sent = channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let msg: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["type"], dc_types().subscribe);
+        assert_eq!(msg["topic"], "rt/lf/sportmodestate");
+    }
+
+    /// Subscribing then injecting a matching text message causes TopicCallback.
+    /// Data pattern mirrors sport_mode_state.py / integration.py.
+    #[tokio::test]
+    async fn subscribed_topic_dispatches_callback_event() {
+        let (service, _channel, dc_tx, cb_rx) = make_service("open");
+
+        service.subscribe("rt/lf/sportmodestate").unwrap();
+
+        let state_msg = json!({
+            "type": "msg",
+            "topic": "rt/lf/sportmodestate",
+            "data": {
+                "mode": 1,
+                "gait_type": 0,
+                "foot_raise_height": 0.09,
+                "position": [0.0, 0.0, 0.0],
+                "body_height": 0.32,
+                "velocity": [0.0, 0.0, 0.0],
+                "yaw_speed": 0.0,
+                "imu_state": {
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                    "gyroscope": [0.0, 0.0, 0.0],
+                    "accelerometer": [0.0, 0.0, 9.81],
+                    "rpy": [0.0, 0.0, 0.0],
+                    "temperature": 36
+                }
+            }
+        });
+
+        dc_tx.send(DcMessage::Text(state_msg.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let event = cb_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("expected a TopicCallback event");
+        match event {
+            CallbackEvent::TopicCallback { topic, payload } => {
+                assert_eq!(topic, "rt/lf/sportmodestate");
+                assert_eq!(payload["data"]["mode"], 1);
+            }
+            other => panic!("Expected TopicCallback, got {:?}", other),
+        }
+    }
+
+    // ── publish_request_new (sport mode pattern) ──────────────────────────────
+
+    /// publish_request_new builds the correct api_id header payload.
+    /// Mirrors sport_mode.py: publish_request_new(SPORT_MOD, {"api_id": GetState})
+    #[tokio::test]
+    async fn publish_request_new_builds_sport_payload() {
+        let (service, channel, dc_tx, _cb_rx) = make_service("open");
+        let request_type = dc_types().request;
+
+        // Inject robot response so the call doesn't time out
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let resp = json!({
+                "type": "res",
+                "topic": "rt/api/sport/request",
+                "data": {
+                    "header": {
+                        "identity": { "id": 0, "api_id": 1034 },
+                        "status": { "code": 0 }
+                    },
+                    "data": ""
+                }
+            });
+            let _ = dc_tx.send(DcMessage::Text(resp.to_string()));
+        });
+
+        let _ = service
+            .publish_request_new(
+                "rt/api/sport/request",
+                json!({"api_id": 1034}), // SPORT_CMD["GetState"]
+                Some(1.0),
+            )
+            .await;
+
+        let sent = channel.sent.lock().unwrap();
+        let req: Value = serde_json::from_str(
+            sent.iter()
+                .find(|s| s.contains("\"type\":\"req\""))
+                .expect("should contain a req message"),
+        )
+        .unwrap();
+
+        assert_eq!(req["type"], request_type);
+        assert_eq!(req["topic"], "rt/api/sport/request");
+        assert_eq!(req["data"]["header"]["identity"]["api_id"], 1034);
+        // parameter must be present as a string field
+        assert!(req["data"]["parameter"].is_string());
+    }
+
+    /// publish_request_new with a dict parameter (FrontFlip from sport_mode.py).
+    #[tokio::test]
+    async fn publish_request_new_with_dict_parameter() {
+        let (service, channel, dc_tx, _cb_rx) = make_service("open");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let resp = json!({"type": "res", "topic": "rt/api/sport/request", "data": {}});
+            let _ = dc_tx.send(DcMessage::Text(resp.to_string()));
+        });
+
+        let _ = service
+            .publish_request_new(
+                "rt/api/sport/request",
+                json!({"api_id": 1030, "parameter": {"data": true}}), // FrontFlip
+                Some(1.0),
+            )
+            .await;
+
+        let sent = channel.sent.lock().unwrap();
+        let req: Value = serde_json::from_str(
+            sent.iter()
+                .find(|s| s.contains("\"type\":\"req\""))
+                .unwrap(),
+        )
+        .unwrap();
+        // non-string parameter is JSON-serialized to a string
+        assert!(
+            req["data"]["parameter"].is_string(),
+            "dict parameter should be stringified"
+        );
+    }
+
+    // ── publish_without_callback ──────────────────────────────────────────────
+
+    /// publish_without_callback sends a msg-type message with no pending waiter.
+    /// Mirrors lidar_stream.py: publish_without_callback("rt/utlidar/switch", "on")
+    #[test]
+    fn publish_without_callback_sends_correct_message() {
+        let (service, channel, _dc_tx, _cb_rx) = make_service("open");
+
+        service
+            .publish_without_callback("rt/utlidar/switch", Some(json!("on")), None)
+            .expect("should succeed on open channel");
+
+        let sent = channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let msg: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["type"], dc_types().msg);
+        assert_eq!(msg["topic"], "rt/utlidar/switch");
+        assert_eq!(msg["data"], "on");
+    }
+
+    /// publish_without_callback fails when channel is not open.
+    #[test]
+    fn publish_without_callback_fails_on_closed_channel() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("closed");
+        assert!(service
+            .publish_without_callback("rt/utlidar/switch", Some(json!("on")), None)
+            .is_err());
+    }
+
+    // ── throttle / should_process ─────────────────────────────────────────────
+
+    /// LiDAR topic is throttled: second immediate call returns false.
+    #[test]
+    fn throttle_limits_lidar_topic() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        let topic = "rt/utlidar/voxel_map_compressed";
+        assert!(service.should_process(topic), "first call should pass");
+        assert!(
+            !service.should_process(topic),
+            "immediate second call should be throttled"
+        );
+    }
+
+    /// Non-throttled topics always pass.
+    #[test]
+    fn unthrottled_topics_always_pass() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        for _ in 0..5 {
+            assert!(service.should_process("rt/lf/sportmodestate"));
+        }
+    }
+
+    // ── decoder switch ────────────────────────────────────────────────────────
+
+    /// set_decoder accepts "native" / "libvoxel", rejects unknown strings.
+    #[test]
+    fn set_decoder_validates_type() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+
+        assert!(service.set_decoder("native").is_ok());
+        assert_eq!(service.decoder_name(), "NativeDecoder");
+
+        assert!(service.set_decoder("libvoxel").is_ok());
+        assert_eq!(service.decoder_name(), "LibVoxelDecoder");
+
+        assert!(service.set_decoder("unknown_decoder").is_err());
+    }
+
+    // ── binary payload routing ────────────────────────────────────────────────
+
+    /// Normal binary (header_1 != 2 bytes) with valid JSON header is parsed.
+    #[test]
+    fn binary_normal_header_parses_json() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+
+        // Normal binary format: 2-byte json_len, 2-byte padding, then json, then binary data.
+        // We make sure header_1 != 2 so it is not mistaken for a LiDAR packet.
+        let json_bytes = br#"{"type":"msg","topic":"rt/custom"}"#;
+        let json_len = json_bytes.len() as u16;
+        assert_ne!(json_len, 2, "pick a json payload longer than 2 bytes");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&json_len.to_le_bytes()); // header_1 = len
+        buf.extend_from_slice(&0u16.to_le_bytes()); // header_2
+        buf.extend_from_slice(json_bytes);
+
+        let result = service.deal_array_buffer(&buf);
+        assert!(
+            result.is_some(),
+            "normal binary with valid JSON header should parse"
+        );
+        let parsed = result.unwrap();
+        assert_eq!(parsed["type"], "msg");
+        assert_eq!(parsed["topic"], "rt/custom");
+    }
+
+    /// Binary with header_1=2, header_2=0 is routed to the LiDAR path (deal_array_buffer_for_lidar).
+    /// With a topic in JSON but no metadata, process_binary_payload returns Some (non-lidar path).
+    /// With valid LiDAR metadata *and* the native decoder active, it would return None (submitted to worker).
+    #[test]
+    fn binary_lidar_tag_routes_to_lidar_path() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+
+        // LiDAR binary format detected by: bytes 0-1 = u16(2), bytes 2-3 = u16(0).
+        // deal_array_buffer_for_lidar(&buffer[4..]) is called on the remainder.
+        // The remainder needs ≥ 8 bytes (4 for json_len, 4 reserved, then JSON).
+        // With valid JSON but no "data.origin/resolution/src_size", metadata is None
+        // → inject_binary_data → Some with binary data injected.
+        let json_bytes = br#"{"topic":"rt/utlidar/voxel_map_compressed"}"#;
+        let json_len = json_bytes.len() as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u16.to_le_bytes()); // header_1 = 2
+        buf.extend_from_slice(&0u16.to_le_bytes()); // header_2 = 0  → lidar tag detected
+        buf.extend_from_slice(&json_len.to_le_bytes()); // 4-byte json len (in lidar sub-buffer)
+        buf.extend_from_slice(&[0u8; 4]); // 4-byte reserved (so json_start = 8 in sub-buffer)
+        buf.extend_from_slice(json_bytes);
+
+        // No metadata in JSON → inject_binary_data path → Some
+        let result = service.deal_array_buffer(&buf);
+        assert!(
+            result.is_some(),
+            "lidar tag without metadata goes through inject_binary_data and returns Some"
+        );
+        let parsed = result.unwrap();
+        assert_eq!(parsed["topic"], "rt/utlidar/voxel_map_compressed");
+    }
+
+    // ── validation flow ───────────────────────────────────────────────────────
+
+    /// "Validation Ok." message sets the data_channel_opened flag to true.
+    #[tokio::test]
+    async fn validation_ok_sets_channel_opened() {
+        let (service, _channel, dc_tx, _cb_rx) = make_service("open");
+
+        // Robot sends a key challenge first
+        let challenge = json!({"type": "validation", "data": "test-key-xyz"});
+        dc_tx.send(DcMessage::Text(challenge.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Then Validation Ok
+        let ok = json!({"type": "validation", "data": "Validation Ok."});
+        dc_tx.send(DcMessage::Text(ok.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            service.data_channel_opened.load(Ordering::Relaxed),
+            "data_channel_opened should be true after Validation Ok."
+        );
+    }
+
+    /// After validation Ok, heartbeat_running transitions to true.
+    #[tokio::test]
+    async fn validation_ok_starts_heartbeat() {
+        let (service, _channel, dc_tx, _cb_rx) = make_service("open");
+
+        let ok = json!({"type": "validation", "data": "Validation Ok."});
+        dc_tx.send(DcMessage::Text(ok.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            service.heartbeat_running.load(Ordering::Relaxed),
+            "heartbeat should start after validation"
+        );
+    }
+
+    // ── chunked response ──────────────────────────────────────────────────────
+
+    /// Chunked response with 2 chunks is reassembled before the callback fires.
+    #[tokio::test]
+    async fn chunked_response_reassembles_before_callback() {
+        let (service, _channel, dc_tx, _cb_rx) = make_service("open");
+
+        let response_type = dc_types().response;
+        let key = format!("{} $ rt/api/audiohub/request", response_type);
+
+        let (sx, rx) = oneshot::channel::<Value>();
+        {
+            service
+                .pending_callbacks
+                .lock()
+                .unwrap()
+                .insert(key, vec![sx]);
+        }
+
+        // Chunk 1 of 2
+        let chunk1 = json!({
+            "type": response_type,
+            "topic": "rt/api/audiohub/request",
+            "data": {
+                "content_info": { "enable_chunking": true, "chunk_index": 1, "total_chunk_num": 2 },
+                "data": [72, 101, 108]   // "Hel"
+            }
+        });
+        dc_tx.send(DcMessage::Text(chunk1.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Callback must NOT have fired yet
+        assert!(rx.is_empty(), "callback must not fire after chunk 1 only");
+
+        // Chunk 2 of 2 (final)
+        let chunk2 = json!({
+            "type": response_type,
+            "topic": "rt/api/audiohub/request",
+            "data": {
+                "content_info": { "enable_chunking": true, "chunk_index": 2, "total_chunk_num": 2 },
+                "data": [108, 111]       // "lo"
+            }
+        });
+        dc_tx.send(DcMessage::Text(chunk2.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let result = rx.await.expect("callback should fire after final chunk");
+        let merged: Vec<u8> = result["data"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(merged, vec![72, 101, 108, 108, 111], "merged = 'Hello'");
+    }
+
+    // ── unsubscribe ───────────────────────────────────────────────────────────
+
+    /// After unsubscribe, incoming topic messages are silently dropped.
+    #[tokio::test]
+    async fn unsubscribe_stops_dispatch() {
+        let (service, _channel, dc_tx, cb_rx) = make_service("open");
+
+        service.subscribe("rt/lf/lowstate").unwrap();
+        service.unsubscribe("rt/lf/lowstate").unwrap();
+
+        let msg = json!({"type":"msg","topic":"rt/lf/lowstate","data":{"motor_state":[]}});
+        dc_tx.send(DcMessage::Text(msg.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            cb_rx.is_empty(),
+            "no callback should fire after unsubscribe"
+        );
+    }
+
+    // ── disable_traffic_saving ────────────────────────────────────────────
+
+    /// disable_traffic_saving sends rtc_inner_req and returns true on success.
+    #[tokio::test]
+    async fn disable_traffic_saving_returns_true_on_success() {
+        let (service, _channel, dc_tx, _cb_rx) = make_service("open");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let resp = json!({
+                "type": dc_types().rtc_inner_req,
+                "topic": "",
+                "info": {"execution": "ok"}
+            });
+            let _ = dc_tx.send(DcMessage::Text(resp.to_string()));
+        });
+
+        let result = service.disable_traffic_saving(true).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    /// disable_traffic_saving returns false when execution != "ok".
+    #[tokio::test]
+    async fn disable_traffic_saving_returns_false_on_failure() {
+        let (service, _channel, dc_tx, _cb_rx) = make_service("open");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let resp = json!({
+                "type": dc_types().rtc_inner_req,
+                "topic": "",
+                "info": {"execution": "failed"}
+            });
+            let _ = dc_tx.send(DcMessage::Text(resp.to_string()));
+        });
+
+        let result = service.disable_traffic_saving(true).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    // ── switch_video_channel / switch_audio_channel ───────────────────────
+
+    /// switch_video_channel sends vid-type message with "on" or "off".
+    #[test]
+    fn switch_video_channel_sends_correct_message() {
+        let (service, channel, _dc_tx, _cb_rx) = make_service("open");
+
+        service.switch_video_channel(true).expect("should succeed");
+
+        let sent = channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let msg: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["type"], dc_types().vid);
+        assert_eq!(msg["data"], "on");
+    }
+
+    #[test]
+    fn switch_video_channel_off_sends_off() {
+        let (service, channel, _dc_tx, _cb_rx) = make_service("open");
+
+        service.switch_video_channel(false).expect("should succeed");
+
+        let sent = channel.sent.lock().unwrap();
+        let msg: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["data"], "off");
+    }
+
+    /// switch_audio_channel sends aud-type message.
+    #[test]
+    fn switch_audio_channel_sends_correct_message() {
+        let (service, channel, _dc_tx, _cb_rx) = make_service("open");
+
+        service.switch_audio_channel(true).expect("should succeed");
+
+        let sent = channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let msg: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["type"], dc_types().aud);
+        assert_eq!(msg["data"], "on");
+    }
+
+    // ── wait_datachannel_open ──────────────────────────────────────────────
+
+    /// wait_datachannel_open returns Ok immediately if already open.
+    #[tokio::test]
+    async fn wait_datachannel_open_succeeds_when_already_open() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        service.data_channel_opened.store(true, Ordering::Relaxed);
+
+        let result = service.wait_datachannel_open(1.0).await;
+        assert!(result.is_ok());
+    }
+
+    /// wait_datachannel_open times out if channel never opens.
+    #[tokio::test]
+    async fn wait_datachannel_open_times_out() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+
+        let result = service.wait_datachannel_open(0.1).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("did not open in time"));
+    }
+
+    /// wait_datachannel_open succeeds when channel opens during wait.
+    #[tokio::test]
+    async fn wait_datachannel_open_succeeds_when_opened_later() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        let service_clone = service.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            service_clone
+                .data_channel_opened
+                .store(true, Ordering::Relaxed);
+        });
+
+        let result = service.wait_datachannel_open(1.0).await;
+        assert!(result.is_ok());
+    }
+
+    // ── stop_background_tasks ──────────────────────────────────────────────
+
+    /// stop_background_tasks sets all background flags to false.
+    #[test]
+    fn stop_background_tasks_sets_flags_to_false() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+
+        service.heartbeat_running.store(true, Ordering::Relaxed);
+        service.network_probe_running.store(true, Ordering::Relaxed);
+        service.data_channel_opened.store(true, Ordering::Relaxed);
+
+        service.stop_background_tasks();
+
+        assert!(!service.heartbeat_running.load(Ordering::Relaxed));
+        assert!(!service.network_probe_running.load(Ordering::Relaxed));
+        assert!(!service.data_channel_opened.load(Ordering::Relaxed));
+    }
+
+    // ── motion switcher flow (sport_mode.py pattern) ──────────────────────
+
+    /// Motion switcher: sends two sequential requests with different api_ids.
+    /// Mirrors sport_mode.py lines 61-84 pattern (check mode, then switch).
+    #[test]
+    fn motion_switcher_flow_sends_two_requests() {
+        let (service, channel, _dc_tx, _cb_rx) = make_service("open");
+
+        // First request: check current mode (api_id: 1001)
+        let _ = service.publish_without_callback(
+            "rt/api/motion_switcher/request",
+            Some(json!({
+                "header": {
+                    "identity": {"api_id": 1001, "id": 0}
+                },
+                "parameter": ""
+            })),
+            Some(dc_types().request),
+        );
+
+        // Second request: switch to normal mode (api_id: 1002, parameter: {"name": "normal"})
+        let _ = service.publish_without_callback(
+            "rt/api/motion_switcher/request",
+            Some(json!({
+                "header": {
+                    "identity": {"api_id": 1002, "id": 0}
+                },
+                "parameter": r#"{"name":"normal"}"#
+            })),
+            Some(dc_types().request),
+        );
+
+        let sent = channel.sent.lock().unwrap();
+        let requests: Vec<Value> = sent
+            .iter()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .filter(|v: &Value| v["type"] == dc_types().request)
+            .collect();
+
+        assert_eq!(requests.len(), 2, "should have sent 2 request messages");
+        assert_eq!(requests[0]["topic"], "rt/api/motion_switcher/request");
+        assert_eq!(requests[0]["data"]["header"]["identity"]["api_id"], 1001);
+        assert_eq!(requests[1]["topic"], "rt/api/motion_switcher/request");
+        assert_eq!(requests[1]["data"]["header"]["identity"]["api_id"], 1002);
     }
 }
