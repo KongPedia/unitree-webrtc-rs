@@ -1,5 +1,6 @@
-use super::codec::{bits_to_points, decompress_lz4};
+use super::codec::{bits_to_points_optimized, decompress_lz4};
 use crate::protocol::models::CallbackEvent;
+use bytes::Bytes;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use serde_json::Value;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use tracing::warn;
 pub struct LidarDecodeRequest {
     pub topic: String,
     pub payload: Value,
-    pub compressed_data: Vec<u8>,
+    pub compressed_data: Bytes,
     pub metadata: LidarMetadata,
 }
 
@@ -47,7 +48,8 @@ pub struct LidarWorkerPool {
 
 impl LidarWorkerPool {
     pub fn new(callback_events_tx: Sender<CallbackEvent>, worker_count: usize) -> Self {
-        let (request_tx, request_rx) = bounded::<LidarDecodeRequest>(64);
+        // Larger queue to handle bursts without dropping frames
+        let (request_tx, request_rx) = bounded::<LidarDecodeRequest>(128);
 
         for worker_id in 0..worker_count {
             let rx = request_rx.clone();
@@ -111,7 +113,7 @@ impl LidarWorkerPool {
         })
     }
 
-    fn decode_lidar(req: &LidarDecodeRequest) -> Result<Vec<f64>, String> {
+    fn decode_lidar(req: &LidarDecodeRequest) -> Result<Vec<f32>, String> {
         let decompressed = decompress_lz4(&req.compressed_data, req.metadata.src_size)?;
 
         if decompressed.len() != req.metadata.src_size {
@@ -122,8 +124,9 @@ impl LidarWorkerPool {
             ));
         }
 
-        // bits_to_points now returns Vec<f64> directly (no conversion needed!)
-        let points = bits_to_points(&decompressed, &req.metadata.origin, req.metadata.resolution);
+        // Use optimized decoder path
+        let points =
+            bits_to_points_optimized(&decompressed, &req.metadata.origin, req.metadata.resolution);
 
         Ok(points)
     }
@@ -138,7 +141,12 @@ impl Clone for LidarWorkerPool {
 }
 
 pub fn create_worker_pool(callback_events_tx: Sender<CallbackEvent>) -> Arc<LidarWorkerPool> {
-    Arc::new(LidarWorkerPool::new(callback_events_tx, 2))
+    // Use CPU count for optimal parallelism, with min 2 and max 4
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(2);
+
+    Arc::new(LidarWorkerPool::new(callback_events_tx, worker_count))
 }
 
 #[cfg(test)]
@@ -201,7 +209,7 @@ mod tests {
         let req = LidarDecodeRequest {
             topic: "rt/utlidar/voxel_map_compressed".to_string(),
             payload: json!({"data": {}}),
-            compressed_data: compressed,
+            compressed_data: Bytes::from(compressed),
             metadata: LidarMetadata {
                 origin,
                 resolution,
@@ -248,7 +256,7 @@ mod tests {
         let req = LidarDecodeRequest {
             topic: "rt/utlidar/voxel_map_compressed".to_string(),
             payload: json!({}),
-            compressed_data: compressed,
+            compressed_data: compressed.into(),
             metadata: LidarMetadata {
                 origin: [0.0; 3],
                 resolution: 0.05,

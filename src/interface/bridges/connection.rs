@@ -62,8 +62,17 @@ impl PyUnitreeWebRTCConnection {
         let connection_method =
             WebRTCConnectionMethod::try_from(resolved_method).map_err(PyValueError::new_err)?;
 
-        let (incoming_tx, incoming_rx) = bounded::<DcMessage>(1024);
-        let (callback_events_tx, callback_events_rx) = bounded::<CallbackEvent>(1024);
+        // Queue sizes based on target environment:
+        // - Local (Jetson): smaller queues due to memory constraints
+        //   720p BGR frame ~2.6 MiB, so callback queue of 64 = ~166 MiB worst case
+        // - Remote (Desktop/Server): larger queues with more memory available
+        let (incoming_capacity, callback_capacity) = match connection_method {
+            WebRTCConnectionMethod::LocalAP | WebRTCConnectionMethod::LocalSTA => (256, 64),
+            WebRTCConnectionMethod::Remote => (512, 128),
+        };
+
+        let (incoming_tx, incoming_rx) = bounded::<DcMessage>(incoming_capacity);
+        let (callback_events_tx, callback_events_rx) = bounded::<CallbackEvent>(callback_capacity);
         let callback_registry: CallbackRegistry = Arc::new(Mutex::new(HashMap::new()));
         spawn_callback_dispatcher(callback_events_rx, Arc::clone(&callback_registry));
         let lidar_worker_pool = lidar::create_worker_pool(callback_events_tx.clone());

@@ -53,4 +53,14 @@ impl PyDataChannelBridge {
             .switch_audio_channel(switch)
             .map_err(to_py_error)
     }
+
+    #[pyo3(signature = (decoder_type))]
+    fn set_decoder(&self, decoder_type: &str) -> PyResult<()> {
+        self.service.set_decoder(decoder_type).map_err(to_py_error)
+    }
+
+    #[getter]
+    fn decoder_name(&self) -> String {
+        self.service.decoder_name()
+    }
 }

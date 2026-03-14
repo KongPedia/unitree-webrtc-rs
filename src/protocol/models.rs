@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -59,7 +60,7 @@ impl RequestIdentity {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DcMessage {
     Text(String),
-    Binary(Vec<u8>),
+    Binary(Bytes),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +72,7 @@ pub enum CallbackEvent {
     LidarCallback {
         topic: String,
         payload: Value,
-        points: Vec<f64>,
+        points: Vec<f32>,
     },
     VideoFrame {
         data: Vec<u8>,
@@ -213,12 +214,12 @@ mod tests {
             DcMessage::Text("world".to_string())
         );
         assert_eq!(
-            DcMessage::Binary(vec![1, 2, 3]),
-            DcMessage::Binary(vec![1, 2, 3])
+            DcMessage::Binary(vec![1, 2, 3].into()),
+            DcMessage::Binary(vec![1, 2, 3].into())
         );
         assert_ne!(
-            DcMessage::Binary(vec![1, 2]),
-            DcMessage::Binary(vec![1, 2, 3])
+            DcMessage::Binary(vec![1, 2].into()),
+            DcMessage::Binary(vec![1, 2, 3].into())
         );
     }
 
@@ -270,7 +271,7 @@ mod tests {
         }
     }
 
-    /// LidarCallback event has topic, payload, and points (Vec<f64> as xyz triplets).
+    /// LidarCallback event has topic, payload, and points (xyz triplets).
     #[test]
     fn callback_event_lidar_callback_has_correct_shape() {
         let points = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 points

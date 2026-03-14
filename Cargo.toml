@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+extension-module = ["pyo3/extension-module"]
 jetson = []
 
 [dependencies]
@@ -48,3 +49,6 @@ gstreamer-audio = "0.25.0"
 
 [build-dependencies]
 pyo3-build-config = "0.28"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }

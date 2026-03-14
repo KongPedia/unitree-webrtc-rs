@@ -3,6 +3,7 @@ use crate::infrastructure::security::encrypt_key;
 use crate::protocol::constants::data_channel_type;
 use crate::protocol::models::{CallbackEvent, DcMessage, RequestIdentity};
 use crate::protocol::ports::{DataChannelPort, PortResult};
+use bytes::Bytes;
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde_json::{json, Map, Value};
@@ -135,7 +136,7 @@ where
             network_probe_running: Arc::new(AtomicBool::new(false)),
             throttle_limits: Arc::new(throttle_limits),
             last_process_time: Arc::new(Mutex::new(HashMap::new())),
-            decoder_type: Arc::new(Mutex::new("libvoxel".to_string())),
+            decoder_type: Arc::new(Mutex::new("native".to_string())),
             lidar_worker_pool,
             is_remote_connection,
         };
@@ -377,8 +378,15 @@ where
     }
 
     pub fn set_decoder(&self, decoder_type: &str) -> PortResult<()> {
-        if decoder_type != "libvoxel" && decoder_type != "native" {
-            return Err("Invalid decoder type. Choose 'libvoxel' or 'native'.".to_string());
+        if decoder_type == "libvoxel" {
+            return Err(
+                "The 'libvoxel' decoder is not supported in the Rust backend. Use 'native'."
+                    .to_string(),
+            );
+        }
+
+        if decoder_type != "native" {
+            return Err("Invalid decoder type. Choose 'native'.".to_string());
         }
 
         let mut current = self.decoder_type.lock().unwrap();
@@ -390,7 +398,7 @@ where
         let current = self.decoder_type.lock().unwrap();
         match current.as_str() {
             "native" => "NativeDecoder".to_string(),
-            _ => "LibVoxelDecoder".to_string(),
+            _ => "UnsupportedDecoder".to_string(),
         }
     }
 
@@ -865,7 +873,7 @@ where
                 let request = LidarDecodeRequest {
                     topic: topic_or_type.clone(),
                     payload: decoded_json,
-                    compressed_data: binary_data.to_vec(),
+                    compressed_data: Bytes::copy_from_slice(binary_data),
                     metadata,
                 };
 
@@ -1371,16 +1379,17 @@ mod tests {
 
     // ── decoder switch ────────────────────────────────────────────────────────
 
-    /// set_decoder accepts "native" / "libvoxel", rejects unknown strings.
+    /// default decoder is native and libvoxel is explicitly unsupported.
     #[test]
     fn set_decoder_validates_type() {
         let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
 
+        assert_eq!(service.decoder_name(), "NativeDecoder");
         assert!(service.set_decoder("native").is_ok());
         assert_eq!(service.decoder_name(), "NativeDecoder");
 
-        assert!(service.set_decoder("libvoxel").is_ok());
-        assert_eq!(service.decoder_name(), "LibVoxelDecoder");
+        assert!(service.set_decoder("libvoxel").is_err());
+        assert_eq!(service.decoder_name(), "NativeDecoder");
 
         assert!(service.set_decoder("unknown_decoder").is_err());
     }
