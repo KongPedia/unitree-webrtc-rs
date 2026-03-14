@@ -171,8 +171,9 @@ impl RtcEngine {
 
     pub fn route_binary_message(&self, payload: Vec<u8>) -> PortResult<()> {
         self.incoming_tx
-            .try_send(DcMessage::Binary(payload))
-            .map_err(|error| error.to_string())
+            .try_send(DcMessage::Binary(payload.into()))
+            .map_err(|e| format!("Failed to send binary message to incoming queue: {e}"))?;
+        Ok(())
     }
 
     pub fn current_ready_state(&self) -> RtcReadyState {
@@ -271,6 +272,6 @@ mod tests {
 
         engine.route_binary_message(vec![1, 2, 3]).unwrap();
 
-        assert_eq!(rx.recv().unwrap(), DcMessage::Binary(vec![1, 2, 3]));
+        assert_eq!(rx.recv().unwrap(), DcMessage::Binary(vec![1, 2, 3].into()));
     }
 }

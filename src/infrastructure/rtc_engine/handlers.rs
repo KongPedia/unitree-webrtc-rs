@@ -43,9 +43,7 @@ pub fn bind_data_channel_handlers(
                         handle_send_error(error, "text");
                     }
                 }
-            } else if let Err(error) =
-                incoming_tx.try_send(DcMessage::Binary(message.data.to_vec()))
-            {
+            } else if let Err(error) = incoming_tx.try_send(DcMessage::Binary(message.data)) {
                 handle_send_error(error, "binary");
             }
         })

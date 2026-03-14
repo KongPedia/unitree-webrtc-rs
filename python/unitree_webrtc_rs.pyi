@@ -208,6 +208,19 @@ class DataChannelBridge:
         """
         ...
 
+    def set_decoder(self, decoder_type: str) -> None:
+        """Set LiDAR decoder backend.
+
+        Args:
+            decoder_type: Must be ``"native"``
+        """
+        ...
+
+    @property
+    def decoder_name(self) -> str:
+        """Current decoder backend display name."""
+        ...
+
 
 class UnitreeWebRTCConnection:
     """Main WebRTC connection to Unitree robot.

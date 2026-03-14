@@ -4,6 +4,47 @@ pub fn decompress_lz4(compressed: &[u8], decompressed_size: usize) -> Result<Vec
     decompress(compressed, decompressed_size).map_err(|e| format!("lz4 decompress failed: {e}"))
 }
 
+/// Optimized version with capacity pre-allocation and reduced branching
+pub fn bits_to_points_optimized(buffer: &[u8], origin: &[f64; 3], resolution: f64) -> Vec<f32> {
+    // Pre-allocate for typical sparse LiDAR frame (~12.5% occupancy)
+    // This reduces reallocations during decode without over-allocating
+    let mut points = Vec::with_capacity(buffer.len() * 3);
+    let resolution = resolution as f32;
+    let origin_x = origin[0] as f32;
+    let origin_y = origin[1] as f32;
+    let origin_z = origin[2] as f32;
+
+    for (byte_index, &byte_value) in buffer.iter().enumerate() {
+        if byte_value == 0 {
+            continue;
+        }
+
+        let z = (byte_index / 0x800) as f32;
+        let n_slice = byte_index % 0x800;
+        let y = (n_slice / 0x10) as f32;
+        let x_base = (n_slice % 0x10) * 8;
+
+        // Process bits with reduced branching
+        let mut bits = byte_value;
+        let mut bit_offset = 0;
+
+        while bits != 0 {
+            if (bits & 0x80) != 0 {
+                let x = (x_base + bit_offset) as f32;
+                points.push(x * resolution + origin_x);
+                points.push(y * resolution + origin_y);
+                points.push(z * resolution + origin_z);
+            }
+            bits <<= 1;
+            bit_offset += 1;
+        }
+    }
+
+    points
+}
+
+/// Original scalar version (for comparison/testing)
+#[cfg(test)]
 pub fn bits_to_points(buffer: &[u8], origin: &[f64; 3], resolution: f64) -> Vec<f64> {
     let mut points = Vec::new();
 

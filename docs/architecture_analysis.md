@@ -67,7 +67,7 @@ Sport Mode는 **특정 topic(`rt/api/sport/request`)에 특정 패턴(`api_id` +
 | 스레드 | DC Router → Dispatcher | DC Router → **Worker Pool** → Dispatcher |
 | 데이터 크기 | 수 KB | 수십~수백 KB (28.8k points/frame) |
 | 스로틀링 | 없음 | 15 FPS 제한 |
-| 디코더 선택 | 없음 | `native` vs `libvoxel` |
+| 디코더 선택 | 없음 | `native` only |
 
 **결론: State와 LiDAR는 같은 subscribe 메커니즘을 사용하지만, 데이터 처리 파이프라인이 완전히 다르므로 분리가 맞음.**
 
