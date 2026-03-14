@@ -1,4 +1,4 @@
-.PHONY: help doctor init build test check bootstrap
+.PHONY: help doctor init build test check bootstrap deploy
 
 help:
 	@echo "Targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  make test       # Run Python tests (if tests/ exists)"
 	@echo "  make check      # Run Rust format/lint/type checks"
 	@echo "  make bootstrap  # Full setup + checks + tests"
+	@echo "  make deploy     # Sync versions and build for release"
 
 doctor:
 	@command -v uv >/dev/null || (echo "uv not found. Install: https://docs.astral.sh/uv/" && exit 1)
@@ -37,3 +38,24 @@ check:
 
 bootstrap: init check test
 	@echo "bootstrap: complete"
+
+deploy:
+	@if [ -n "$(VERSION)" ]; then \
+		echo "🔄 Updating version to $(VERSION)..."; \
+		./scripts/sync-version.sh $(VERSION); \
+	fi
+	@echo "🚀 Deploy: Syncing versions and building for release..."
+	@echo "📋 Current versions:"
+	@echo "   Cargo.toml:    $$(grep '^version = ' Cargo.toml | cut -d'"' -f2)"
+	@echo "   pyproject.toml: $$(grep '^version = ' pyproject.toml | cut -d'"' -f2)"
+	@echo ""
+	@echo "✅ Versions are synchronized"
+	@echo ""
+	@echo " Building Python wheel for distribution..."
+	uv run maturin build --release
+	@echo ""
+	@echo "🎉 Deploy complete!"
+	@echo "   Build artifacts:"
+	@echo "   - Python wheel: target/wheels/"
+	@echo ""
+	@echo "💡 To install: pip install target/wheels/unitree_webrtc_rs-*.whl"
