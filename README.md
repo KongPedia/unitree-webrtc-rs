@@ -69,22 +69,40 @@ Rust-owned WebRTC transport layer for **Unitree Go2** robots, exposed to Python 
 | `reqwest` 0.13 | HTTP client for signaling |
 | `tracing` / `tracing-subscriber` | Structured logging |
 
-### System (must be installed)
+## Installation
 
-| Dependency | Install |
-|---|---|
-| **GLib / GObject** | `brew install glib` (macOS) / `apt install libglib2.0-dev` (Ubuntu/Jetson) |
-| **GStreamer 1.20+** | `brew install gstreamer` (macOS) / `apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav` (Ubuntu/Jetson) |
-| **pkg-config** | `brew install pkg-config` / `apt install pkg-config` |
-| **OpenSSL** | Usually pre-installed; `apt install libssl-dev` if missing |
-| **Rust toolchain** | Auto-selected by `rust-toolchain.toml` (currently `1.92.0`). Install rustup from [rustup.rs](https://rustup.rs). |
+The easiest way to use `unitree-webrtc-rs` is to install the pre-built wheels from PyPI. Wheels are provided for Linux (x86_64), macOS (Apple Silicon), and Jetson (aarch64).
 
-### Python
+```bash
+pip install unitree-webrtc-rs
+```
 
+### System Dependencies
+
+While the native WebRTC and LiDAR decoders are bundled, **GStreamer is strictly required** by the system to run Video decoding and Audio encoding/decoding.
+
+#### Ubuntu / Jetson (JetPack 6 / Ubuntu 22.04+)
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav \
+    pkg-config
+```
+
+#### macOS
+```bash
+brew install gstreamer gst-plugins-base pkg-config
+```
+
+### Optional Python Dependencies
+
+For running the examples (Video viewing, Audio playing):
 | Package | Purpose |
 |---|---|
-| `numpy >=1.24` | Required — frame/point array types |
-| `maturin >=1.5` | Build tool (dev only) |
 | `opencv-python >=4.8` | Optional — video display in examples |
 | `pyaudio` | Optional — audio playback in examples |
 
@@ -326,27 +344,22 @@ from unitree_webrtc_rs.webrtc_driver import RTC_TOPIC, SPORT_CMD  # also works
 
 ## Project Structure
 
-```
+```text
 unitree-webrtc-rs/
-├── Cargo.toml              # Rust dependencies
-├── pyproject.toml           # Python project / maturin config
+├── Cargo.toml               # Rust dependencies
+├── pyproject.toml           # Python project / uv build config
 ├── src/
-│   ├── lib.rs               # PyO3 module entry point
-│   ├── interface/
-│   │   ├── py_api.rs        # Python-facing classes (Connection, Bridges)
-│   │   └── constants.rs     # All protocol constants (topics, commands, errors)
-│   ├── application/
-│   │   ├── connection_service.rs
-│   │   ├── datachannel_service.rs
-│   │   ├── lidar_service.rs
-│   │   ├── video_service.rs
-│   │   ├── audio_service.rs
-│   │   └── audio_sender_service.rs
-│   ├── infrastructure/
-│   │   ├── rtc_engine.rs     # WebRTC peer connection management
-│   │   └── signaling_http.rs # HTTP signaling client
-│   └── domain/
-│       └── models.rs         # DcMessage, CallbackEvent, etc.
+│   ├── audio/               # Audio streaming (GStreamer send/receive)
+│   ├── connection/          # WebRTC connection management service
+│   ├── datachannel/         # Data routing, pub/sub, and LiDAR codec
+│   ├── infrastructure/      # Low-level WebRTC engine / HTTP signaling
+│   ├── interface/           # PyO3 bridges, Python-facing APIs, and callbacks
+│   ├── protocol/            # Models, ports, and WebRTC constants
+│   ├── video/               # H.264 video RTP streaming & GStreamer
+│   └── lib.rs               # PyO3 module entry point
+├── tests/
+│   ├── example_flows_test.rs # Rust integration tests (no real robot needed)
+│   └── test_python_api.py   # Python API mocked pytest suite
 └── examples/
     ├── connect.py
     ├── sport_mode.py
