@@ -181,14 +181,11 @@ class DataChannelBridge:
         """Get PubSub bridge for messaging."""
         ...
 
-    def disableTrafficSaving(self, switch: bool = True) -> Awaitable[bool]:
+    def disableTrafficSaving(self, switch: bool = True) -> Awaitable[None]:
         """Disable traffic saving mode.
         
         Args:
             switch: True to disable traffic saving
-            
-        Returns:
-            Success status
         """
         ...
 
