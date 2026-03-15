@@ -23,12 +23,18 @@ doctor:
 
 init: doctor
 	uv sync --dev
+	uv run pre-commit install
 	uv run maturin develop
 
 build:
 	uv run maturin develop
 
-test:
+test: test-rust test-python
+
+test-rust:
+	RUSTFLAGS="-C link-args=-Wl,-undefined,dynamic_lookup" cargo test
+
+test-python:
 	@if [ -d tests ]; then uv run pytest -q; else echo "No tests directory; skipping pytest."; fi
 
 check:

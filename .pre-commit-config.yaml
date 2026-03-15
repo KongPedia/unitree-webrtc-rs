@@ -1,0 +1,29 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  # Python code formatting/linting using Ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.9
+    hooks:
+      - id: ruff
+        args: [ --fix ]
+      - id: ruff-format
+
+  # Rust formatting and linting (cargo fmt & cargo clippy)
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        description: Format rust code.
+        entry: cargo fmt
+        language: system
+        types: [rust]
+        args: ["--all", "--", "--check"]
+      - id: clippy
+        name: cargo clippy
+        description: Lint rust code.
+        entry: cargo clippy
+        language: system
+        types: [rust]
+        args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
