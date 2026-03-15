@@ -65,7 +65,7 @@ jobs:
       
       - name: Build wheels with maturin
         run: |
-          uv run maturin build --release --out dist --locked
+          uv run maturin build --release --out dist
       
       - name: Upload wheels as artifacts
         uses: actions/upload-artifact@v7
