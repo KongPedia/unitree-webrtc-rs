@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
-#[pyclass(name = "UnitreeWebRTCConnection", unsendable)]
+#[pyclass(name = "UnitreeWebRTCConnection")]
 pub struct PyUnitreeWebRTCConnection {
     connection_method: WebRTCConnectionMethod,
     serial_number: Option<String>,
