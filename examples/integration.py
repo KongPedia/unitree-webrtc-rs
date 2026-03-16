@@ -15,10 +15,11 @@ RTC_TOPIC = {
     "LOW_STATE": "rt/lf/lowstate",
     "SPORT_MOD": "rt/api/sport/request",
     "MOTION_SWITCHER": "rt/api/motion_switcher/request",
+    "LF_SPORT_MOD_STATE": "rt/lf/sportmodestate",
 }
 
 SPORT_CMD = {
-    "Damp": 1001,
+    # "Damp": 1001,
     "BalanceStand": 1002,
     "StandUp": 1004,
     "StandDown": 1005,
@@ -97,16 +98,24 @@ class IntegrationTest:
         # Get SportModeState via pub/sub
         print("\n[SportModeState Request]")
         
-        response = await self.conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"], 
-            {"api_id": 1001}
-        )
+        self.sportmode_received = False
+        def sportmode_callback(message):
+            self.sportmode_received = True
+            if 'data' in message:
+                self.sportmode_state_data = message['data']
+            
+        self.conn.datachannel.pub_sub.subscribe(RTC_TOPIC['LF_SPORT_MOD_STATE'], sportmode_callback)
         
-        if response and 'data' in response:
-            self.sportmode_state_data = response['data']
-            print(f"✅ SportModeState response received")
+        # Wait for data
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            if self.sportmode_received:
+                break
+                
+        if self.sportmode_state_data:
+            print(f"✅ SportModeState received")
             print(f"   Type: {type(self.sportmode_state_data)}")
-            print(f"   Response: {self.sportmode_state_data}")
+            print(f"   Keys: {list(self.sportmode_state_data.keys())[:10]}...")
         else:
             print(f"❌ SportModeState not received")
         
@@ -307,7 +316,7 @@ class IntegrationTest:
 
 
 async def main():
-    test = IntegrationTest(ip="10.2.80.101")
+    test = IntegrationTest(ip="10.2.80.114")
     await test.run_all_tests()
 
 

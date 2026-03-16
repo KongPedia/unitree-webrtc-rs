@@ -1,0 +1,105 @@
+name: Build and Publish JetPack 6 Wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        type: string
+      publish_to_pypi:
+        description: Publish the built wheel to PyPI
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheel:
+    name: Build JetPack 6 wheel
+    runs-on:
+      - self-hosted
+      - linux
+      - arm64
+      - jetpack6
+    strategy:
+      matrix:
+        python-bin: [python3.10, python3.11, python3.12]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: latest
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --fix-broken \
+            libunwind-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libopus-dev \
+            pkg-config \
+            gstreamer1.0-tools
+
+      - name: Verify JetPack runtime
+        run: |
+          python3 --version
+          ${{ matrix.python-bin }} --version
+          uname -a
+          gst-inspect-1.0 nvv4l2decoder
+
+      - name: Sync uv dependencies
+        run: uv sync --locked
+
+      - name: Build wheel
+        env:
+          PYO3_PYTHON: ${{ matrix.python-bin }}
+        run: |
+          uv run maturin build --release --out dist --locked -i ${{ matrix.python-bin }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel-jetpack6-${{ matrix.python-bin }}
+          path: dist/*.whl
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish JetPack 6 wheel to PyPI
+    if: ${{ inputs.publish_to_pypi }}
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/unitree-webrtc-rs
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download JetPack 6 wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-jetpack6-*
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lah dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          attestations: false
+          password: ${{ secrets.PYPI_API_TOKEN }}
