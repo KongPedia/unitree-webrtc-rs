@@ -1,6 +1,6 @@
 [package]
 name = "unitree-webrtc-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["jongmoon-konglabs"]
 description = "Rust-owned WebRTC transport for Unitree Go2 robots"
