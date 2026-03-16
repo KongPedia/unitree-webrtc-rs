@@ -63,16 +63,33 @@ impl H264Decoder {
             "GStreamer H264 decoder selected"
         );
 
-        let pipeline_str = format!(
-            "appsrc name=src is-live=true do-timestamp=true format=time block=false \
-             caps=video/x-h264,stream-format=byte-stream,alignment=nal \
-             ! h264parse \
-             ! {decoder_name} \
-             ! videoconvert \
-             ! video/x-raw,format=BGR \
-             ! appsink name=sink emit-signals=false sync=false \
-               max-buffers=2 drop=true"
-        );
+        let pipeline_str = if decoder_name == "nvv4l2decoder" {
+            // Jetson GPU decoder requires nvvidconv to convert from NVMM to CPU memory
+            format!(
+                "appsrc name=src is-live=true do-timestamp=true format=time block=false \
+                 caps=video/x-h264,stream-format=byte-stream,alignment=nal \
+                 ! h264parse \
+                 ! {decoder_name} \
+                 ! nvvidconv \
+                 ! video/x-raw,format=BGRx \
+                 ! videoconvert \
+                 ! video/x-raw,format=BGR \
+                 ! appsink name=sink emit-signals=false sync=false \
+                   max-buffers=2 drop=true"
+            )
+        } else {
+            // Software decoder (avdec_h264) can use videoconvert directly
+            format!(
+                "appsrc name=src is-live=true do-timestamp=true format=time block=false \
+                 caps=video/x-h264,stream-format=byte-stream,alignment=nal \
+                 ! h264parse \
+                 ! {decoder_name} \
+                 ! videoconvert \
+                 ! video/x-raw,format=BGR \
+                 ! appsink name=sink emit-signals=false sync=false \
+                   max-buffers=2 drop=true"
+            )
+        };
 
         let pipeline = gst::parse::launch(&pipeline_str)
             .map_err(|e| format!("Failed to create GStreamer pipeline: {e}"))?

@@ -141,3 +141,134 @@ where
         self.intentional_disconnect.load(Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ports::PortResult;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct MockSignalingPort {
+        called: Arc<AtomicBool>,
+    }
+
+    impl SignalingPort for MockSignalingPort {
+        fn exchange_sdp<'a>(
+            &'a self,
+            _ip: &'a str,
+            _offer: &'a str,
+        ) -> Pin<Box<dyn Future<Output = PortResult<String>> + Send + 'a>> {
+            self.called.store(true, Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"type":"answer","sdp":"mock_sdp"}"#.to_string()) })
+        }
+    }
+
+    struct MockRtcEnginePort {
+        prepared: Arc<AtomicBool>,
+        applied: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl RtcEnginePort for MockRtcEnginePort {
+        fn prepare_offer<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = PortResult<String>> + Send + 'a>> {
+            self.prepared.store(true, Ordering::Relaxed);
+            Box::pin(async { Ok("mock_offer_sdp".to_string()) })
+        }
+
+        fn apply_answer<'a>(
+            &'a self,
+            _answer_sdp: &'a str,
+        ) -> Pin<Box<dyn Future<Output = PortResult<()>> + Send + 'a>> {
+            self.applied.store(true, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            self.closed.store(true, Ordering::Relaxed);
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_success_local_sta() {
+        let sig = Arc::new(MockSignalingPort {
+            called: Arc::new(AtomicBool::new(false)),
+        });
+        let engine = Arc::new(MockRtcEnginePort {
+            prepared: Arc::new(AtomicBool::new(false)),
+            applied: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+        });
+
+        let service = ConnectionService::new(
+            sig.clone(),
+            engine.clone(),
+            WebRTCConnectionMethod::LocalSTA,
+            Some("192.168.1.1".to_string()),
+        );
+
+        let res = service.connect().await;
+        assert!(res.is_ok());
+        assert!(sig.called.load(Ordering::Relaxed));
+        assert!(engine.prepared.load(Ordering::Relaxed));
+        assert!(engine.applied.load(Ordering::Relaxed));
+        assert!(service.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect() {
+        let sig = Arc::new(MockSignalingPort {
+            called: Arc::new(AtomicBool::new(false)),
+        });
+        let engine = Arc::new(MockRtcEnginePort {
+            prepared: Arc::new(AtomicBool::new(false)),
+            applied: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+        });
+
+        let service = ConnectionService::new(
+            sig,
+            engine.clone(),
+            WebRTCConnectionMethod::LocalSTA,
+            Some("192.168.1.1".to_string()),
+        );
+
+        service.disconnect().await;
+        assert!(engine.closed.load(Ordering::Relaxed));
+        assert!(!service.is_connected());
+        assert!(service.intentional_disconnect());
+    }
+
+    #[tokio::test]
+    async fn test_reconnect() {
+        let sig = Arc::new(MockSignalingPort {
+            called: Arc::new(AtomicBool::new(false)),
+        });
+        let engine = Arc::new(MockRtcEnginePort {
+            prepared: Arc::new(AtomicBool::new(false)),
+            applied: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+        });
+
+        let service = ConnectionService::new(
+            sig,
+            engine.clone(),
+            WebRTCConnectionMethod::LocalSTA,
+            Some("192.168.1.1".to_string()),
+        );
+
+        // initial state
+        assert!(!service.is_connected());
+
+        // simulate reconnect calling close and then connect
+        let res = service.reconnect().await;
+        assert!(res.is_ok());
+        assert!(engine.closed.load(Ordering::Relaxed));
+        assert!(engine.prepared.load(Ordering::Relaxed));
+        assert!(engine.applied.load(Ordering::Relaxed));
+        assert!(service.is_connected());
+    }
+}
