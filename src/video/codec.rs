@@ -4,27 +4,64 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use std::env;
 use tracing::{info, warn};
 
 /// Detect the best available H264 decoder plugin at runtime.
-/// Priority: nvv4l2decoder (Jetson GPU) > avdec_h264 (libav software).
+/// Priority:
+///   1. explicit `UNITREE_WEBRTC_H264_DECODER`
+///   2. auto-detect: nvv4l2decoder (Jetson GPU) > avdec_h264 (libav software)
 /// Returns an error if no suitable decoder is found.
 fn detect_h264_decoder() -> Result<&'static str, String> {
     let registry = gst::Registry::get();
+    let requested = env::var("UNITREE_WEBRTC_H264_DECODER")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase();
+
+    let has_nvv4l2 = registry
+        .find_feature("nvv4l2decoder", gst::ElementFactory::static_type())
+        .is_some();
+    let has_avdec = registry
+        .find_feature("avdec_h264", gst::ElementFactory::static_type())
+        .is_some();
+
+    match requested.as_str() {
+        "" | "auto" => {}
+        "nvv4l2decoder" => {
+            if has_nvv4l2 {
+                return Ok("nvv4l2decoder");
+            }
+            return Err(
+                "UNITREE_WEBRTC_H264_DECODER=nvv4l2decoder was requested, but the plugin is not available."
+                    .to_string(),
+            );
+        }
+        "avdec_h264" => {
+            if has_avdec {
+                return Ok("avdec_h264");
+            }
+            return Err(
+                "UNITREE_WEBRTC_H264_DECODER=avdec_h264 was requested, but the plugin is not available."
+                    .to_string(),
+            );
+        }
+        other => {
+            return Err(
+                format!(
+                    "Unsupported UNITREE_WEBRTC_H264_DECODER='{other}'. Use auto, nvv4l2decoder, or avdec_h264."
+                ),
+            );
+        }
+    }
 
     // Priority 1: Jetson NVDEC hardware decoder
-    if registry
-        .find_feature("nvv4l2decoder", gst::ElementFactory::static_type())
-        .is_some()
-    {
+    if has_nvv4l2 {
         return Ok("nvv4l2decoder");
     }
 
     // Priority 2: GStreamer libav software decoder
-    if registry
-        .find_feature("avdec_h264", gst::ElementFactory::static_type())
-        .is_some()
-    {
+    if has_avdec {
         return Ok("avdec_h264");
     }
 
@@ -60,6 +97,7 @@ impl H264Decoder {
             event = "video_decoder_init",
             backend = "gstreamer",
             decoder = decoder_name,
+            requested_decoder = %env::var("UNITREE_WEBRTC_H264_DECODER").unwrap_or_else(|_| "auto".to_string()),
             "GStreamer H264 decoder selected"
         );
 
