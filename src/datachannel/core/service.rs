@@ -15,6 +15,78 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
+struct PendingCallback {
+    sender: oneshot::Sender<PortResult<Value>>,
+    expectation: ResponseExpectation,
+    session_id: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ResponseExpectation {
+    topics: Option<Vec<String>>,
+    api_id: Option<i64>,
+}
+
+impl ResponseExpectation {
+    fn any() -> Self {
+        Self {
+            topics: None,
+            api_id: None,
+        }
+    }
+
+    fn for_api_request(request_topic: &str, api_id: i64) -> Self {
+        let response_topic = expected_response_topic(request_topic);
+        let mut topics = vec![request_topic.to_string()];
+        if response_topic != request_topic {
+            topics.push(response_topic);
+        }
+
+        Self {
+            topics: Some(topics),
+            api_id: Some(api_id),
+        }
+    }
+
+    fn validate(&self, message: &Value) -> PortResult<()> {
+        if let Some(expected_topics) = &self.topics {
+            let actual_topic = message
+                .get("topic")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !expected_topics.iter().any(|topic| topic == actual_topic) {
+                return Err(format!(
+                    "Response topic mismatch: expected one of {expected_topics:?}, got {actual_topic}"
+                ));
+            }
+        }
+
+        if let Some(expected_api_id) = self.api_id {
+            let actual_api_id = message
+                .get("data")
+                .and_then(|value| value.get("header"))
+                .and_then(|value| value.get("identity"))
+                .and_then(|value| value.get("api_id"))
+                .and_then(Value::as_i64);
+            if actual_api_id != Some(expected_api_id) {
+                return Err(format!(
+                    "Response api_id mismatch: expected {expected_api_id}, got {:?}",
+                    actual_api_id
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn expected_response_topic(request_topic: &str) -> String {
+    request_topic
+        .strip_suffix("/request")
+        .map(|prefix| format!("{prefix}/response"))
+        .unwrap_or_else(|| request_topic.to_string())
+}
+
 struct DataChannelTypes {
     validation: &'static str,
     subscribe: &'static str,
@@ -67,7 +139,7 @@ where
     T: DataChannelPort + 'static,
 {
     transport: Arc<T>,
-    pending_callbacks: Arc<Mutex<HashMap<String, Vec<oneshot::Sender<Value>>>>>,
+    pending_callbacks: Arc<Mutex<HashMap<String, PendingCallback>>>,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     chunk_data_storage: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
     validation_key: Arc<Mutex<String>>,
@@ -81,6 +153,8 @@ where
     decoder_type: Arc<Mutex<String>>,
     lidar_worker_pool: Arc<LidarWorkerPool>,
     is_remote_connection: bool,
+    session_id: Arc<AtomicU64>,
+    request_sequence: Arc<AtomicU64>,
 }
 
 impl<T> Clone for DataChannelService<T>
@@ -104,6 +178,8 @@ where
             decoder_type: Arc::clone(&self.decoder_type),
             lidar_worker_pool: Arc::clone(&self.lidar_worker_pool),
             is_remote_connection: self.is_remote_connection,
+            session_id: Arc::clone(&self.session_id),
+            request_sequence: Arc::clone(&self.request_sequence),
         }
     }
 }
@@ -139,6 +215,8 @@ where
             decoder_type: Arc::new(Mutex::new("native".to_string())),
             lidar_worker_pool,
             is_remote_connection,
+            session_id: Arc::new(AtomicU64::new(Self::new_session_id())),
+            request_sequence: Arc::new(AtomicU64::new(Self::initial_request_sequence())),
         };
 
         let service_for_router = service.clone();
@@ -159,6 +237,24 @@ where
         msg_type: Option<&str>,
         timeout_secs: Option<f64>,
     ) -> PortResult<Value> {
+        self.publish_with_expectation(
+            topic,
+            data,
+            msg_type,
+            timeout_secs,
+            ResponseExpectation::any(),
+        )
+        .await
+    }
+
+    async fn publish_with_expectation(
+        &self,
+        topic: &str,
+        data: Option<Value>,
+        msg_type: Option<&str>,
+        timeout_secs: Option<f64>,
+        expectation: ResponseExpectation,
+    ) -> PortResult<Value> {
         if self.transport.ready_state() != "open" {
             return Err("Data channel is not open".to_string());
         }
@@ -170,10 +266,20 @@ where
             data.as_ref().and_then(Self::outgoing_identifier_from_data),
         );
 
-        let (tx, rx) = oneshot::channel::<Value>();
+        let (tx, rx) = oneshot::channel::<PortResult<Value>>();
         {
             let mut pending = self.pending_callbacks.lock().unwrap();
-            pending.entry(key.clone()).or_default().push(tx);
+            if pending.contains_key(&key) {
+                return Err(format!("Duplicate in-flight request key: {key}"));
+            }
+            pending.insert(
+                key.clone(),
+                PendingCallback {
+                    sender: tx,
+                    expectation,
+                    session_id: self.session_id.load(Ordering::Relaxed),
+                },
+            );
         }
 
         if let Err(error) = self.send_message(topic, data, effective_type) {
@@ -183,7 +289,7 @@ where
 
         let timeout = timeout_secs.unwrap_or(10.0);
         match tokio::time::timeout(Duration::from_secs_f64(timeout), rx).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => response,
             Ok(Err(_)) => {
                 self.drop_pending_callbacks(&key);
                 Err("Response receiver dropped".to_string())
@@ -225,7 +331,7 @@ where
         let id = options
             .get("id")
             .and_then(Value::as_i64)
-            .unwrap_or_else(Self::generated_identity_id);
+            .unwrap_or_else(|| self.generated_identity_id());
 
         let mut request_payload = json!({
             "header": {
@@ -249,11 +355,12 @@ where
             request_payload["header"]["policy"] = json!({ "priority": 1 });
         }
 
-        self.publish(
+        self.publish_with_expectation(
             topic,
             Some(request_payload),
             Some(dc_types().request),
             timeout_secs,
+            ResponseExpectation::for_api_request(topic, api_id),
         )
         .await
     }
@@ -356,6 +463,26 @@ where
         }
     }
 
+    pub fn ready_state(&self) -> &'static str {
+        self.transport.ready_state()
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.transport.ready_state() == "open" && self.data_channel_opened.load(Ordering::Relaxed)
+    }
+
+    pub fn heartbeat_running(&self) -> bool {
+        self.heartbeat_running.load(Ordering::Relaxed)
+    }
+
+    pub fn last_heartbeat_age_s(&self) -> Option<u64> {
+        let last = self.heartbeat_last_response.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        Some(Self::now_secs_u64().saturating_sub(last))
+    }
+
     pub fn should_process(&self, topic_or_type: &str) -> bool {
         if let Some(limit) = self.throttle_limits.get(topic_or_type) {
             let now = Self::now_secs_f64();
@@ -375,6 +502,13 @@ where
         self.heartbeat_running.store(false, Ordering::Relaxed);
         self.network_probe_running.store(false, Ordering::Relaxed);
         self.data_channel_opened.store(false, Ordering::Relaxed);
+        self.start_new_session();
+    }
+
+    pub fn start_new_session(&self) {
+        self.session_id
+            .store(Self::new_session_id(), Ordering::Relaxed);
+        self.fail_all_pending("DataChannel session reset");
     }
 
     pub fn set_decoder(&self, decoder_type: &str) -> PortResult<()> {
@@ -438,17 +572,7 @@ where
             return;
         }
 
-        let key = Self::incoming_key(message);
-        let callbacks = {
-            let mut pending = self.pending_callbacks.lock().unwrap();
-            pending.remove(&key)
-        };
-
-        if let Some(callbacks) = callbacks {
-            for callback in callbacks {
-                let _ = callback.send(message.clone());
-            }
-        }
+        self.resolve_pending_response(&Self::incoming_key(message), message.clone());
     }
 
     fn handle_chunked_response(&self, message: &Value) -> bool {
@@ -498,16 +622,7 @@ where
                 let mut merged_message = message.clone();
                 merged_message["data"]["data"] = Self::bytes_to_json_array(&merged);
 
-                let callbacks = {
-                    let mut pending = self.pending_callbacks.lock().unwrap();
-                    pending.remove(&key)
-                };
-
-                if let Some(callbacks) = callbacks {
-                    for callback in callbacks {
-                        let _ = callback.send(merged_message.clone());
-                    }
-                }
+                self.resolve_pending_response(&key, merged_message);
             }
 
             return true;
@@ -561,16 +676,7 @@ where
             let mut merged_message = message.clone();
             merged_message["info"]["file"]["data"] = Self::bytes_to_json_array(&merged);
 
-            let callbacks = {
-                let mut pending = self.pending_callbacks.lock().unwrap();
-                pending.remove(&key)
-            };
-
-            if let Some(callbacks) = callbacks {
-                for callback in callbacks {
-                    let _ = callback.send(merged_message.clone());
-                }
-            }
+            self.resolve_pending_response(&key, merged_message);
         }
 
         true
@@ -930,6 +1036,7 @@ where
                             "Heartbeat timeout detected"
                         );
                         service.heartbeat_running.store(false, Ordering::Relaxed);
+                        service.data_channel_opened.store(false, Ordering::Relaxed);
                         break;
                     }
 
@@ -1032,13 +1139,59 @@ where
         pending.remove(key);
     }
 
-    fn generated_identity_id() -> i64 {
-        let now_ms = SystemTime::now()
+    fn resolve_pending_response(&self, key: &str, message: Value) {
+        let callback = {
+            let mut pending = self.pending_callbacks.lock().unwrap();
+            pending.remove(key)
+        };
+
+        let Some(callback) = callback else {
+            return;
+        };
+
+        let current_session = self.session_id.load(Ordering::Relaxed);
+        let result = if callback.session_id != current_session {
+            Err("Response belongs to a stale DataChannel session".to_string())
+        } else {
+            callback.expectation.validate(&message).map(|_| message)
+        };
+
+        let _ = callback.sender.send(result);
+    }
+
+    fn fail_all_pending(&self, reason: &str) {
+        let callbacks = {
+            let mut pending = self.pending_callbacks.lock().unwrap();
+            pending
+                .drain()
+                .map(|(_, callback)| callback)
+                .collect::<Vec<_>>()
+        };
+
+        for callback in callbacks {
+            let _ = callback.sender.send(Err(reason.to_string()));
+        }
+    }
+
+    fn generated_identity_id(&self) -> i64 {
+        const MAX_WIRE_ID: u64 = i32::MAX as u64;
+        let next = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        ((next % MAX_WIRE_ID) + 1) as i64
+    }
+
+    fn initial_request_sequence() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
+            .map(|duration| duration.as_micros() as u64)
+            .unwrap_or(1)
+    }
+
+    fn new_session_id() -> u64 {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0);
-        let random_part: i64 = (rand::random::<u16>() % 1000) as i64;
-        (now_ms % 2_147_483_648) + random_part
+        timestamp ^ rand::random::<u64>()
     }
 
     fn now_secs_u64() -> u64 {
@@ -1256,11 +1409,11 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let resp = json!({
-                "type": "res",
-                "topic": "rt/api/sport/request",
+                "type": dc_types().response,
+                "topic": "rt/api/sport/response",
                 "data": {
                     "header": {
-                        "identity": { "id": 0, "api_id": 1034 },
+                        "identity": { "id": 4242, "api_id": 1034 },
                         "status": { "code": 0 }
                     },
                     "data": ""
@@ -1272,10 +1425,11 @@ mod tests {
         let _ = service
             .publish_request_new(
                 "rt/api/sport/request",
-                json!({"api_id": 1034}), // SPORT_CMD["GetState"]
+                json!({"api_id": 1034, "id": 4242}), // SPORT_CMD["GetState"]
                 Some(1.0),
             )
-            .await;
+            .await
+            .expect("matching sport response should resolve");
 
         let sent = channel.sent.lock().unwrap();
         let req: Value = serde_json::from_str(
@@ -1288,8 +1442,113 @@ mod tests {
         assert_eq!(req["type"], request_type);
         assert_eq!(req["topic"], "rt/api/sport/request");
         assert_eq!(req["data"]["header"]["identity"]["api_id"], 1034);
+        assert_eq!(req["data"]["header"]["identity"]["id"], 4242);
         // parameter must be present as a string field
         assert!(req["data"]["parameter"].is_string());
+    }
+
+    #[tokio::test]
+    async fn publish_request_new_rejects_mismatched_response_topic() {
+        let (service, _channel, dc_tx, _cb_rx) = make_service("open");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let resp = json!({
+                "type": dc_types().response,
+                "topic": "rt/api/vui/response",
+                "data": {
+                    "header": {
+                        "identity": { "id": 5252, "api_id": 1005 },
+                        "status": { "code": 0 }
+                    },
+                    "data": ""
+                }
+            });
+            let _ = dc_tx.send(DcMessage::Text(resp.to_string()));
+        });
+
+        let result = service
+            .publish_request_new(
+                "rt/api/sport/request",
+                json!({"api_id": 1005, "id": 5252}),
+                Some(1.0),
+            )
+            .await;
+
+        assert!(
+            result.unwrap_err().contains("Response topic mismatch"),
+            "wrong topic must not resolve as success"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_request_new_rejects_duplicate_inflight_id() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        let first_service = service.clone();
+
+        let first = tokio::spawn(async move {
+            first_service
+                .publish_request_new(
+                    "rt/api/sport/request",
+                    json!({"api_id": 1034, "id": 6262}),
+                    Some(0.2),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = service
+            .publish_request_new(
+                "rt/api/vui/request",
+                json!({"api_id": 1001, "id": 6262}),
+                Some(0.2),
+            )
+            .await;
+
+        assert!(
+            second
+                .unwrap_err()
+                .contains("Duplicate in-flight request key"),
+            "same wire id must not create a second waiter"
+        );
+
+        let _ = first.await.expect("first task should finish");
+    }
+
+    #[test]
+    fn generated_identity_ids_are_unique_in_burst() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        let mut ids = HashSet::new();
+
+        for _ in 0..2_000 {
+            let id = service.generated_identity_id();
+            assert!(ids.insert(id), "generated id collision: {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_new_session_fails_pending_requests() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        let request_service = service.clone();
+
+        let pending = tokio::spawn(async move {
+            request_service
+                .publish_request_new(
+                    "rt/api/sport/request",
+                    json!({"api_id": 1034, "id": 7272}),
+                    Some(5.0),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        service.start_new_session();
+
+        let result = pending.await.expect("request task should finish");
+        assert!(
+            result.unwrap_err().contains("DataChannel session reset"),
+            "session reset must fail stale pending requests"
+        );
     }
 
     /// publish_request_new with a dict parameter (FrontFlip from sport_mode.py).
@@ -1299,17 +1558,28 @@ mod tests {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let resp = json!({"type": "res", "topic": "rt/api/sport/request", "data": {}});
+            let resp = json!({
+                "type": dc_types().response,
+                "topic": "rt/api/sport/response",
+                "data": {
+                    "header": {
+                        "identity": { "id": 8383, "api_id": 1030 },
+                        "status": { "code": 0 }
+                    },
+                    "data": ""
+                }
+            });
             let _ = dc_tx.send(DcMessage::Text(resp.to_string()));
         });
 
         let _ = service
             .publish_request_new(
                 "rt/api/sport/request",
-                json!({"api_id": 1030, "parameter": {"data": true}}), // FrontFlip
+                json!({"api_id": 1030, "id": 8383, "parameter": {"data": true}}), // FrontFlip
                 Some(1.0),
             )
-            .await;
+            .await
+            .expect("matching sport response should resolve");
 
         let sent = channel.sent.lock().unwrap();
         let req: Value = serde_json::from_str(
@@ -1501,13 +1771,16 @@ mod tests {
         let response_type = dc_types().response;
         let key = format!("{} $ rt/api/audiohub/request", response_type);
 
-        let (sx, rx) = oneshot::channel::<Value>();
+        let (sx, mut rx) = oneshot::channel::<PortResult<Value>>();
         {
-            service
-                .pending_callbacks
-                .lock()
-                .unwrap()
-                .insert(key, vec![sx]);
+            service.pending_callbacks.lock().unwrap().insert(
+                key,
+                PendingCallback {
+                    sender: sx,
+                    expectation: ResponseExpectation::any(),
+                    session_id: service.session_id.load(Ordering::Relaxed),
+                },
+            );
         }
 
         // Chunk 1 of 2
@@ -1523,7 +1796,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         // Callback must NOT have fired yet
-        assert!(rx.is_empty(), "callback must not fire after chunk 1 only");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "callback must not fire after chunk 1 only"
+        );
 
         // Chunk 2 of 2 (final)
         let chunk2 = json!({
@@ -1537,7 +1816,10 @@ mod tests {
         dc_tx.send(DcMessage::Text(chunk2.to_string())).unwrap();
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        let result = rx.await.expect("callback should fire after final chunk");
+        let result = rx
+            .await
+            .expect("callback should fire after final chunk")
+            .expect("chunked response should validate");
         let merged: Vec<u8> = result["data"]["data"]
             .as_array()
             .unwrap()
@@ -1687,6 +1969,22 @@ mod tests {
 
         let result = service.wait_datachannel_open(1.0).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn datachannel_status_reports_transport_and_heartbeat() {
+        let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
+        service.data_channel_opened.store(true, Ordering::Relaxed);
+        service.heartbeat_running.store(true, Ordering::Relaxed);
+        service.heartbeat_last_response.store(
+            DataChannelService::<MockDataChannel>::now_secs_u64().saturating_sub(3),
+            Ordering::Relaxed,
+        );
+
+        assert_eq!(service.ready_state(), "open");
+        assert!(service.is_open());
+        assert!(service.heartbeat_running());
+        assert!(service.last_heartbeat_age_s().unwrap() >= 3);
     }
 
     // ── stop_background_tasks ──────────────────────────────────────────────

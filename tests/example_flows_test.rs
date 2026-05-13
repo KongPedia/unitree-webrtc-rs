@@ -163,9 +163,9 @@ async fn test_sport_mode_example_flow() {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             env_clone.push_incoming_message(
                 r#"{
-                "type": "response",
+                "type": "res",
                 "topic": "rt/api/sport/request",
-                "data": {"header": {"identity": {"id": 1}}, "parameter": "mock_state"}
+                "data": {"header": {"identity": {"id": 1, "api_id": 1034}}, "parameter": "mock_state"}
             }"#,
             );
         }

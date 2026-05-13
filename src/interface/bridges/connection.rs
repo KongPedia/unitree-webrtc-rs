@@ -110,6 +110,7 @@ impl PyUnitreeWebRTCConnection {
         let service = Arc::clone(&self.service);
         let datachannel_service = Arc::clone(&self.datachannel_service);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            datachannel_service.stop_background_tasks();
             service.connect().await.map_err(to_py_error)?;
             datachannel_service
                 .wait_datachannel_open(5.0)
@@ -133,6 +134,7 @@ impl PyUnitreeWebRTCConnection {
         let service = Arc::clone(&self.service);
         let datachannel_service = Arc::clone(&self.datachannel_service);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            datachannel_service.stop_background_tasks();
             service.reconnect().await.map_err(to_py_error)?;
             datachannel_service
                 .wait_datachannel_open(5.0)

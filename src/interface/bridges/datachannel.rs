@@ -63,4 +63,44 @@ impl PyDataChannelBridge {
     fn decoder_name(&self) -> String {
         self.service.decoder_name()
     }
+
+    #[getter]
+    fn ready_state(&self) -> &'static str {
+        self.service.ready_state()
+    }
+
+    #[getter(readyState)]
+    fn ready_state_legacy(&self) -> &'static str {
+        self.service.ready_state()
+    }
+
+    #[getter]
+    fn is_open(&self) -> bool {
+        self.service.is_open()
+    }
+
+    #[getter(isOpen)]
+    fn is_open_legacy(&self) -> bool {
+        self.service.is_open()
+    }
+
+    #[getter]
+    fn heartbeat_running(&self) -> bool {
+        self.service.heartbeat_running()
+    }
+
+    #[getter(heartbeatRunning)]
+    fn heartbeat_running_legacy(&self) -> bool {
+        self.service.heartbeat_running()
+    }
+
+    #[getter]
+    fn last_heartbeat_age_s(&self) -> Option<u64> {
+        self.service.last_heartbeat_age_s()
+    }
+
+    #[getter(lastHeartbeatAgeS)]
+    fn last_heartbeat_age_s_legacy(&self) -> Option<u64> {
+        self.service.last_heartbeat_age_s()
+    }
 }
