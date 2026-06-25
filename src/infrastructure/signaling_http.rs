@@ -131,7 +131,13 @@ pub async fn send_sdp_local_with_aes_key(
 ) -> Result<String, String> {
     match send_sdp_local_old(ip, sdp_json).await {
         Ok(answer) => Ok(answer),
-        Err(_) => send_sdp_local_new_with_aes_key(ip, sdp_json, aes_128_key).await,
+        Err(legacy_error) => send_sdp_local_new_with_aes_key(ip, sdp_json, aes_128_key)
+            .await
+            .map_err(|new_error| {
+                format!(
+                    "legacy offer failed ({legacy_error}); con_notify offer failed ({new_error})"
+                )
+            }),
     }
 }
 
@@ -164,12 +170,15 @@ fn decode_con_notify_data1(
         .get("data1")
         .and_then(Value::as_str)
         .ok_or_else(|| "con_notify data1 field missing".to_string())?;
-    let data2 = decoded_json
-        .get("data2")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
+    let data2 = match decoded_json.get("data2") {
+        Some(value) => value
+            .as_i64()
+            .ok_or_else(|| format!("con_notify data2 must be an integer, got {value}"))?,
+        None => 0,
+    };
 
     match data2 {
+        0 => Ok(data1.to_string()),
         2 => decrypt_con_notify_data(data1),
         3 => {
             let key = aes_128_key
@@ -181,7 +190,7 @@ fn decode_con_notify_data1(
                 })?;
             decrypt_con_notify_data_with_aes_128_key(data1, key)
         }
-        _ => Ok(data1.to_string()),
+        mode => Err(format!("unsupported con_notify data2 auth mode: {mode}")),
     }
 }
 
@@ -239,6 +248,25 @@ mod tests {
             decode_con_notify_data1(&decoded_json, None).unwrap(),
             "plain"
         );
+    }
+
+    #[test]
+    fn con_notify_missing_data2_defaults_to_plaintext() {
+        let decoded_json = json!({"data1": "plain"});
+
+        assert_eq!(
+            decode_con_notify_data1(&decoded_json, None).unwrap(),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn con_notify_unknown_data2_is_explicit_error() {
+        let decoded_json = json!({"data1": "encrypted", "data2": 4});
+
+        let err = decode_con_notify_data1(&decoded_json, None).unwrap_err();
+
+        assert!(err.contains("unsupported con_notify data2 auth mode: 4"));
     }
 
     #[test]
