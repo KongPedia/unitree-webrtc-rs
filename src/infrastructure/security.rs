@@ -72,6 +72,44 @@ pub fn aes_ecb_decrypt(encoded_cipher_text: &str, key: &str) -> Result<String, S
 }
 
 pub fn aes_gcm_decrypt(encoded_cipher_text: &str) -> Result<String, String> {
+    aes_gcm_decrypt_with_key(encoded_cipher_text, &CON_NOTIFY_KEY)
+}
+
+pub fn aes_gcm_decrypt_with_hex_key(
+    encoded_cipher_text: &str,
+    aes_128_key: &str,
+) -> Result<String, String> {
+    let key = validate_aes128_hex_key(aes_128_key)?;
+    aes_gcm_decrypt_with_key(encoded_cipher_text, &key)
+}
+
+pub fn decrypt_con_notify_data(encoded_cipher_text: &str) -> Result<String, String> {
+    aes_gcm_decrypt(encoded_cipher_text)
+}
+
+pub fn decrypt_con_notify_data_with_aes_128_key(
+    encoded_cipher_text: &str,
+    aes_128_key: &str,
+) -> Result<String, String> {
+    if aes_128_key.trim().is_empty() {
+        return Err(
+            "con_notify data2=3 requires aes_128_key or UNITREE_AES_128_KEY/GO2_DORA_UNITREE_AES_128_KEY"
+                .to_string(),
+        );
+    }
+
+    aes_gcm_decrypt_with_hex_key(encoded_cipher_text, aes_128_key).map_err(|error| {
+        if error.starts_with("AES-128 key") {
+            error
+        } else {
+            format!(
+                "AES-GCM decrypt failed for con_notify data2=3; per-device aes_128_key was rejected or payload is corrupt: {error}"
+            )
+        }
+    })
+}
+
+fn aes_gcm_decrypt_with_key(encoded_cipher_text: &str, key: &[u8; 16]) -> Result<String, String> {
     let payload = STANDARD
         .decode(encoded_cipher_text)
         .map_err(|error| error.to_string())?;
@@ -88,16 +126,12 @@ pub fn aes_gcm_decrypt(encoded_cipher_text: &str) -> Result<String, String> {
     ciphertext_with_tag.extend_from_slice(ciphertext);
     ciphertext_with_tag.extend_from_slice(tag);
 
-    let cipher = Aes128Gcm::new_from_slice(&CON_NOTIFY_KEY).map_err(|error| error.to_string())?;
+    let cipher = Aes128Gcm::new_from_slice(key).map_err(|error| error.to_string())?;
     let plain_bytes = cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext_with_tag.as_ref())
         .map_err(|error| error.to_string())?;
 
     String::from_utf8(plain_bytes).map_err(|error| error.to_string())
-}
-
-pub fn decrypt_con_notify_data(encoded_cipher_text: &str) -> Result<String, String> {
-    aes_gcm_decrypt(encoded_cipher_text)
 }
 
 pub fn rsa_load_public_key(encoded_public_key: &str) -> Result<RsaPublicKey, String> {
@@ -139,6 +173,22 @@ fn validate_aes256_key(key: &str) -> Result<&[u8], String> {
     }
 
     Ok(key_bytes)
+}
+
+fn validate_aes128_hex_key(key: &str) -> Result<[u8; 16], String> {
+    let trimmed = key.trim();
+    if trimmed.len() != 32 {
+        return Err(format!(
+            "AES-128 key must be 32 hex characters, got {}",
+            trimmed.len()
+        ));
+    }
+
+    let decoded =
+        hex::decode(trimmed).map_err(|error| format!("AES-128 key must be valid hex: {error}"))?;
+    decoded.try_into().map_err(|bytes: Vec<u8>| {
+        format!("AES-128 key must decode to 16 bytes, got {}", bytes.len())
+    })
 }
 
 fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
@@ -222,8 +272,58 @@ mod tests {
     }
 
     #[test]
+    fn aes_gcm_con_notify_round_trip_with_per_device_key() {
+        let key_hex = "00112233445566778899aabbccddeeff";
+        let key = validate_aes128_hex_key(key_hex).unwrap();
+        let encoded = encode_con_notify_payload(&key, b"notify-payload-v3");
+
+        assert_eq!(
+            decrypt_con_notify_data_with_aes_128_key(&encoded, key_hex).unwrap(),
+            "notify-payload-v3"
+        );
+    }
+
+    #[test]
+    fn aes_gcm_con_notify_rejects_invalid_per_device_key() {
+        let err = decrypt_con_notify_data_with_aes_128_key("payload", "abcd").unwrap_err();
+        assert!(err.contains("32 hex characters"));
+    }
+
+    #[test]
+    fn aes_gcm_con_notify_rejects_wrong_per_device_key() {
+        let key = validate_aes128_hex_key("00112233445566778899aabbccddeeff").unwrap();
+        let encoded = encode_con_notify_payload(&key, b"notify-payload-v3");
+
+        let err =
+            decrypt_con_notify_data_with_aes_128_key(&encoded, "ffeeddccbbaa99887766554433221100")
+                .unwrap_err();
+
+        assert!(err.contains("data2=3"));
+        assert!(err.contains("rejected"));
+    }
+
+    #[test]
     fn generated_aes_key_has_expected_length() {
         let key = generate_aes_key();
         assert_eq!(key.len(), 32);
+    }
+
+    fn encode_con_notify_payload(key: &[u8; 16], plain: &[u8]) -> String {
+        let cipher = Aes128Gcm::new_from_slice(key).unwrap();
+        let nonce = [9_u8; 12];
+        let ciphertext_with_tag = cipher
+            .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
+            .unwrap();
+
+        let split_index = ciphertext_with_tag.len() - 16;
+        let ciphertext = &ciphertext_with_tag[..split_index];
+        let tag = &ciphertext_with_tag[split_index..];
+
+        let mut packed = Vec::new();
+        packed.extend_from_slice(ciphertext);
+        packed.extend_from_slice(&nonce);
+        packed.extend_from_slice(tag);
+
+        STANDARD.encode(packed)
     }
 }

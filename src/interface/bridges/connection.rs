@@ -17,8 +17,26 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
+use std::env;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
+
+const AES_128_KEY_ENV_VARS: [&str; 2] = ["GO2_DORA_UNITREE_AES_128_KEY", "UNITREE_AES_128_KEY"];
+
+fn resolve_aes_128_key(explicit_key: Option<String>) -> Option<String> {
+    normalize_aes_128_key(explicit_key).or_else(|| {
+        AES_128_KEY_ENV_VARS.iter().find_map(|name| {
+            env::var(name)
+                .ok()
+                .and_then(|value| normalize_aes_128_key(Some(value)))
+        })
+    })
+}
+
+fn normalize_aes_128_key(key: Option<String>) -> Option<String> {
+    key.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 #[pyclass(name = "UnitreeWebRTCConnection")]
 pub struct PyUnitreeWebRTCConnection {
@@ -27,6 +45,7 @@ pub struct PyUnitreeWebRTCConnection {
     ip: Option<String>,
     _username: Option<String>,
     _password: Option<String>,
+    _aes_128_key: Option<String>,
     service: Arc<ConnectionService<HttpSignalingClient, RtcEngine>>,
     rtc_engine: Arc<RtcEngine>,
     datachannel_service: Arc<DataChannelService<RtcEngine>>,
@@ -37,17 +56,19 @@ pub struct PyUnitreeWebRTCConnection {
 #[pymethods]
 impl PyUnitreeWebRTCConnection {
     #[new]
-    #[pyo3(signature = (connection_method, serial_number=None, ip=None, username=None, password=None, **kwargs))]
+    #[pyo3(signature = (connection_method, serial_number=None, ip=None, username=None, password=None, aes_128_key=None, **kwargs))]
     fn new(
         connection_method: i32,
         serial_number: Option<String>,
         ip: Option<String>,
         username: Option<String>,
         password: Option<String>,
+        aes_128_key: Option<String>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let mut resolved_method = connection_method;
         let mut resolved_serial = serial_number.clone();
+        let mut resolved_aes_128_key = aes_128_key.clone();
 
         if let Some(kwargs) = kwargs {
             if let Ok(Some(value)) = kwargs.get_item("connectionMethod") {
@@ -57,7 +78,17 @@ impl PyUnitreeWebRTCConnection {
             if let Ok(Some(value)) = kwargs.get_item("serialNumber") {
                 resolved_serial = Some(value.extract::<String>()?);
             }
+
+            for key in ["aes_128_key", "aes128Key", "aes128_key"] {
+                if let Ok(Some(value)) = kwargs.get_item(key) {
+                    if !value.is_none() {
+                        resolved_aes_128_key = Some(value.extract::<String>()?);
+                    }
+                }
+            }
         }
+
+        let resolved_aes_128_key = resolve_aes_128_key(resolved_aes_128_key);
 
         let connection_method =
             WebRTCConnectionMethod::try_from(resolved_method).map_err(PyValueError::new_err)?;
@@ -76,7 +107,7 @@ impl PyUnitreeWebRTCConnection {
         let callback_registry: CallbackRegistry = Arc::new(Mutex::new(HashMap::new()));
         spawn_callback_dispatcher(callback_events_rx, Arc::clone(&callback_registry));
         let lidar_worker_pool = lidar::create_worker_pool(callback_events_tx.clone());
-        let signaling = Arc::new(HttpSignalingClient);
+        let signaling = Arc::new(HttpSignalingClient::new(resolved_aes_128_key.clone()));
         let engine = Arc::new(RtcEngine::new(incoming_tx, callback_events_tx.clone()));
         let service = Arc::new(ConnectionService::new(
             signaling,
@@ -98,6 +129,7 @@ impl PyUnitreeWebRTCConnection {
             ip,
             _username: username,
             _password: password,
+            _aes_128_key: resolved_aes_128_key,
             service,
             rtc_engine: engine,
             datachannel_service,

@@ -242,7 +242,8 @@ class UnitreeWebRTCConnection:
         ip: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
-        **kwargs: Any
+        aes_128_key: Optional[str] = None,
+        **kwargs: Any,
     ) -> None:
         """Initialize WebRTC connection.
         
@@ -252,6 +253,10 @@ class UnitreeWebRTCConnection:
             ip: Robot IP address (for LocalAP/LocalSTA)
             username: Authentication username (optional)
             password: Authentication password (optional)
+            aes_128_key: Per-device AES-128 hex key required by Go2 firmware
+                1.1.15+ LAN con_notify handshakes using data2=3. If omitted,
+                ``GO2_DORA_UNITREE_AES_128_KEY`` then ``UNITREE_AES_128_KEY``
+                are checked.
             **kwargs: Additional connection parameters
         """
         ...
