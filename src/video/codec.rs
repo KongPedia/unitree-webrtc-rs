@@ -11,6 +11,7 @@ use tracing::{info, warn};
 /// Priority:
 ///   1. explicit `UNITREE_WEBRTC_H264_DECODER`
 ///   2. auto-detect: nvv4l2decoder (Jetson GPU) > avdec_h264 (libav software)
+///
 /// Returns an error if no suitable decoder is found.
 fn detect_h264_decoder() -> Result<&'static str, String> {
     let registry = gst::Registry::get();

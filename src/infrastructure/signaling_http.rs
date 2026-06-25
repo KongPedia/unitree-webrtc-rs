@@ -1,6 +1,6 @@
 use crate::infrastructure::security::{
-    aes_ecb_decrypt, aes_ecb_encrypt, decrypt_con_notify_data, generate_aes_key, rsa_encrypt,
-    rsa_load_public_key,
+    aes_ecb_decrypt, aes_ecb_encrypt, decrypt_con_notify_data,
+    decrypt_con_notify_data_with_aes_128_key, generate_aes_key, rsa_encrypt, rsa_load_public_key,
 };
 use crate::protocol::ports::{PortResult, SignalingPort};
 use base64::engine::general_purpose::STANDARD;
@@ -11,7 +11,17 @@ use std::future::Future;
 use std::pin::Pin;
 
 #[derive(Debug, Clone, Default)]
-pub struct HttpSignalingClient;
+pub struct HttpSignalingClient {
+    aes_128_key: Option<String>,
+}
+
+impl HttpSignalingClient {
+    pub fn new(aes_128_key: Option<String>) -> Self {
+        Self {
+            aes_128_key: normalize_optional_key(aes_128_key),
+        }
+    }
+}
 
 pub async fn send_sdp_local_old(ip: &str, sdp_json: &str) -> Result<String, String> {
     let url = format!("http://{ip}:8081/offer");
@@ -36,6 +46,14 @@ pub async fn send_sdp_local_old(ip: &str, sdp_json: &str) -> Result<String, Stri
 }
 
 pub async fn send_sdp_local_new(ip: &str, sdp_json: &str) -> Result<String, String> {
+    send_sdp_local_new_with_aes_key(ip, sdp_json, None).await
+}
+
+async fn send_sdp_local_new_with_aes_key(
+    ip: &str,
+    sdp_json: &str,
+    aes_128_key: Option<&str>,
+) -> Result<String, String> {
     let client = Client::new();
     let notify_url = format!("http://{ip}:9991/con_notify");
 
@@ -60,19 +78,7 @@ pub async fn send_sdp_local_new(ip: &str, sdp_json: &str) -> Result<String, Stri
 
     let mut decoded_json: Value =
         serde_json::from_str(&decoded_text).map_err(|error| error.to_string())?;
-    let data2 = decoded_json
-        .get("data2")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-
-    if data2 == 2 {
-        let encrypted = decoded_json
-            .get("data1")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "con_notify data1 field missing".to_string())?;
-        let decrypted = decrypt_con_notify_data(encrypted)?;
-        decoded_json["data1"] = Value::String(decrypted);
-    }
+    decoded_json["data1"] = Value::String(decode_con_notify_data1(&decoded_json, aes_128_key)?);
 
     let data1 = decoded_json
         .get("data1")
@@ -115,9 +121,17 @@ pub async fn send_sdp_local_new(ip: &str, sdp_json: &str) -> Result<String, Stri
 }
 
 pub async fn send_sdp_local(ip: &str, sdp_json: &str) -> Result<String, String> {
+    send_sdp_local_with_aes_key(ip, sdp_json, None).await
+}
+
+pub async fn send_sdp_local_with_aes_key(
+    ip: &str,
+    sdp_json: &str,
+    aes_128_key: Option<&str>,
+) -> Result<String, String> {
     match send_sdp_local_old(ip, sdp_json).await {
         Ok(answer) => Ok(answer),
-        Err(_) => send_sdp_local_new(ip, sdp_json).await,
+        Err(_) => send_sdp_local_new_with_aes_key(ip, sdp_json, aes_128_key).await,
     }
 }
 
@@ -131,7 +145,43 @@ impl SignalingPort for HttpSignalingClient {
         ip: &'a str,
         offer: &'a str,
     ) -> Pin<Box<dyn Future<Output = PortResult<String>> + Send + 'a>> {
-        Box::pin(async move { send_sdp_local(ip, offer).await })
+        Box::pin(async move {
+            send_sdp_local_with_aes_key(ip, offer, self.aes_128_key.as_deref()).await
+        })
+    }
+}
+
+fn normalize_optional_key(key: Option<String>) -> Option<String> {
+    key.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn decode_con_notify_data1(
+    decoded_json: &Value,
+    aes_128_key: Option<&str>,
+) -> Result<String, String> {
+    let data1 = decoded_json
+        .get("data1")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "con_notify data1 field missing".to_string())?;
+    let data2 = decoded_json
+        .get("data2")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    match data2 {
+        2 => decrypt_con_notify_data(data1),
+        3 => {
+            let key = aes_128_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "con_notify data2=3 requires aes_128_key or UNITREE_AES_128_KEY/GO2_DORA_UNITREE_AES_128_KEY"
+                        .to_string()
+                })?;
+            decrypt_con_notify_data_with_aes_128_key(data1, key)
+        }
+        _ => Ok(data1.to_string()),
     }
 }
 
@@ -163,7 +213,12 @@ fn calc_local_path_ending(data1: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::calc_local_path_ending;
+    use super::{calc_local_path_ending, decode_con_notify_data1};
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde_json::json;
 
     #[test]
     fn path_ending_uses_second_char_index() {
@@ -174,5 +229,56 @@ mod tests {
     #[test]
     fn short_string_returns_empty() {
         assert!(calc_local_path_ending("short").is_empty());
+    }
+
+    #[test]
+    fn con_notify_data2_plaintext_passes_through() {
+        let decoded_json = json!({"data1": "plain", "data2": 0});
+
+        assert_eq!(
+            decode_con_notify_data1(&decoded_json, None).unwrap(),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn con_notify_data2_3_requires_per_device_key() {
+        let decoded_json = json!({"data1": "encrypted", "data2": 3});
+
+        let err = decode_con_notify_data1(&decoded_json, None).unwrap_err();
+
+        assert!(err.contains("data2=3"));
+        assert!(err.contains("aes_128_key"));
+    }
+
+    #[test]
+    fn con_notify_data2_3_uses_per_device_key() {
+        let key_hex = "00112233445566778899aabbccddeeff";
+        let key: [u8; 16] = hex::decode(key_hex).unwrap().try_into().unwrap();
+        let decoded_json = json!({
+            "data1": encode_data2_3_payload(&key, b"v3-public-key-payload"),
+            "data2": 3,
+        });
+
+        assert_eq!(
+            decode_con_notify_data1(&decoded_json, Some(key_hex)).unwrap(),
+            "v3-public-key-payload"
+        );
+    }
+
+    fn encode_data2_3_payload(key: &[u8; 16], plain: &[u8]) -> String {
+        let cipher = Aes128Gcm::new_from_slice(key).unwrap();
+        let nonce = [5_u8; 12];
+        let ciphertext_with_tag = cipher
+            .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
+            .unwrap();
+
+        let split_index = ciphertext_with_tag.len() - 16;
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&ciphertext_with_tag[..split_index]);
+        packed.extend_from_slice(&nonce);
+        packed.extend_from_slice(&ciphertext_with_tag[split_index..]);
+
+        STANDARD.encode(packed)
     }
 }

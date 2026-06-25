@@ -11,6 +11,11 @@ from unitree_webrtc_rs.webrtc_driver import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="unitree_webrtc_rs connect test")
     parser.add_argument("--ip", default=os.getenv("ROBOT_IP", "10.2.80.114"))
+    parser.add_argument(
+        "--aes-128-key",
+        default=os.getenv("GO2_DORA_UNITREE_AES_128_KEY") or os.getenv("UNITREE_AES_128_KEY"),
+        help="32-character per-device AES-128 hex key required by Go2 firmware 1.1.15+ LAN handshakes",
+    )
     parser.add_argument("--duration", type=float, default=5.0)
     return parser.parse_args()
 
@@ -18,7 +23,11 @@ def parse_args() -> argparse.Namespace:
 async def main() -> None:
     args = parse_args()
 
-    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=args.ip)
+    conn = UnitreeWebRTCConnection(
+        WebRTCConnectionMethod.LocalSTA,
+        ip=args.ip,
+        aes_128_key=args.aes_128_key,
+    )
     # conn = UnitreeWebRTCConnection(
     #     WebRTCConnectionMethod.LocalSTA, serialNumber="B42D2000XXXXXXXX"
     # )
