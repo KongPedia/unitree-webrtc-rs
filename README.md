@@ -153,7 +153,7 @@ async def main():
         WebRTCConnectionMethod.LocalSTA,
         ip="192.168.12.1",
         # Required for Go2 firmware 1.1.15+ LAN handshakes that return data2=3.
-        # If omitted, GO2_DORA_UNITREE_AES_128_KEY then UNITREE_AES_128_KEY are checked.
+        # If omitted, GO2_DORA_UNITREE_AES_128_KEY is checked.
         aes_128_key="00112233445566778899aabbccddeeff",
     )
     await conn.connect()
@@ -166,7 +166,7 @@ asyncio.run(main())
 
 For Go2 firmware `1.1.15+`, the LAN `/con_notify` handshake may use `data2=3`,
 which requires the robot's per-device AES-128 hex key. Pass it with
-`aes_128_key=...` or set `GO2_DORA_UNITREE_AES_128_KEY`/`UNITREE_AES_128_KEY`.
+`aes_128_key=...` or set `GO2_DORA_UNITREE_AES_128_KEY`.
 
 ### Send Sport Command
 

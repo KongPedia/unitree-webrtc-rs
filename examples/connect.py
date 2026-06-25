@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--aes-128-key-file",
-        default=os.getenv("GO2_DORA_UNITREE_AES_128_KEY_FILE") or os.getenv("UNITREE_AES_128_KEY_FILE"),
+        default=os.getenv("GO2_DORA_UNITREE_AES_128_KEY_FILE"),
         help="Path to a file containing the per-device AES key; preferred over passing the key as argv.",
     )
     parser.add_argument("--duration", type=float, default=5.0)
@@ -36,7 +36,7 @@ def _resolve_aes_key(args: argparse.Namespace) -> str | None:
         file_key = Path(args.aes_128_key_file).expanduser().read_text().strip()
         if file_key:
             return file_key
-    env_key = os.getenv("GO2_DORA_UNITREE_AES_128_KEY") or os.getenv("UNITREE_AES_128_KEY")
+    env_key = os.getenv("GO2_DORA_UNITREE_AES_128_KEY")
     return env_key.strip() if env_key else None
 
 

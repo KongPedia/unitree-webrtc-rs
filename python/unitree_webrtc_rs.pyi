@@ -255,8 +255,7 @@ class UnitreeWebRTCConnection:
             password: Authentication password (optional)
             aes_128_key: Per-device AES-128 hex key required by Go2 firmware
                 1.1.15+ LAN con_notify handshakes using data2=3. If omitted,
-                ``GO2_DORA_UNITREE_AES_128_KEY`` then ``UNITREE_AES_128_KEY``
-                are checked.
+                ``GO2_DORA_UNITREE_AES_128_KEY`` is checked.
             **kwargs: Additional connection parameters
         """
         ...

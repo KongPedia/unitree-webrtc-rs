@@ -93,8 +93,7 @@ pub fn decrypt_con_notify_data_with_aes_128_key(
 ) -> Result<String, String> {
     if aes_128_key.trim().is_empty() {
         return Err(
-            "con_notify data2=3 requires aes_128_key or UNITREE_AES_128_KEY/GO2_DORA_UNITREE_AES_128_KEY"
-                .to_string(),
+            "con_notify data2=3 requires aes_128_key or GO2_DORA_UNITREE_AES_128_KEY".to_string(),
         );
     }
 

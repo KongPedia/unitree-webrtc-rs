@@ -21,15 +21,13 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
-const AES_128_KEY_ENV_VARS: [&str; 2] = ["GO2_DORA_UNITREE_AES_128_KEY", "UNITREE_AES_128_KEY"];
+const AES_128_KEY_ENV_VAR: &str = "GO2_DORA_UNITREE_AES_128_KEY";
 
 fn resolve_aes_128_key(explicit_key: Option<String>) -> Option<String> {
     normalize_aes_128_key(explicit_key).or_else(|| {
-        AES_128_KEY_ENV_VARS.iter().find_map(|name| {
-            env::var(name)
-                .ok()
-                .and_then(|value| normalize_aes_128_key(Some(value)))
-        })
+        env::var(AES_128_KEY_ENV_VAR)
+            .ok()
+            .and_then(|value| normalize_aes_128_key(Some(value)))
     })
 }
 
@@ -252,5 +250,53 @@ impl PyUnitreeWebRTCConnection {
                 callback_registry: Arc::clone(&self.callback_registry),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn resolve_aes_128_key_prefers_explicit_key() {
+        let _guard = env_lock().lock().unwrap();
+        env::set_var(
+            "GO2_DORA_UNITREE_AES_128_KEY",
+            "ffeeddccbbaa99887766554433221100",
+        );
+
+        assert_eq!(
+            resolve_aes_128_key(Some(" 00112233445566778899aabbccddeeff ".to_string())),
+            Some("00112233445566778899aabbccddeeff".to_string())
+        );
+
+        env::remove_var("GO2_DORA_UNITREE_AES_128_KEY");
+    }
+
+    #[test]
+    fn resolve_aes_128_key_uses_only_canonical_env_key() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("GO2_DORA_UNITREE_AES_128_KEY");
+        env::set_var("UNITREE_AES_128_KEY", "ffeeddccbbaa99887766554433221100");
+
+        assert_eq!(resolve_aes_128_key(None), None);
+
+        env::set_var(
+            "GO2_DORA_UNITREE_AES_128_KEY",
+            "00112233445566778899aabbccddeeff",
+        );
+        assert_eq!(
+            resolve_aes_128_key(None),
+            Some("00112233445566778899aabbccddeeff".to_string())
+        );
+
+        env::remove_var("GO2_DORA_UNITREE_AES_128_KEY");
+        env::remove_var("UNITREE_AES_128_KEY");
     }
 }

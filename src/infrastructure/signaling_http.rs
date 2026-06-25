@@ -185,7 +185,7 @@ fn decode_con_notify_data1(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    "con_notify data2=3 requires aes_128_key or UNITREE_AES_128_KEY/GO2_DORA_UNITREE_AES_128_KEY"
+                    "con_notify data2=3 requires aes_128_key or GO2_DORA_UNITREE_AES_128_KEY"
                         .to_string()
                 })?;
             decrypt_con_notify_data_with_aes_128_key(data1, key)
