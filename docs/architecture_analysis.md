@@ -1,245 +1,71 @@
-# unitree-webrtc-rs 아키텍처 분석 및 구조 제안
+# Architecture and extension context
 
+This map describes the Rust-owned SDK, not a proposed Python package tree. Use it to locate responsibilities and assess extensions; exact runtime limits and migration details belong in [resource-policy.md](engineering/resource-policy.md), and design rules belong in [conventions.md](engineering/conventions.md).
 
-```
-unitree_webrtc/
-├── connection/         # connect, disconnect, reconnect, auto-reconnect
-├── datachannel/
-│   ├── core/           # validation, heartbeat, message routing, (base pub/sub)
-│   ├── sport/          # sport mode commands, GetState
-│   ├── state/          # subscription wrappers (SportModeState, LowState, etc.)
-│   ├── lidar/          # lidar switch, subscription, decoder selection
-│   ├── slam/           # (향후) SLAM mapping, navigation
-│   ├── uwb/            # (향후) UWB tracking
-│   ├── vui/            # (향후) VUI
-│   └── arm/            # (향후) arm control
-├── video/              # video receive, H.264 decode
-├── audio/
-│   ├── receive/        # audio RX (Opus decode)
-│   └── transmit/       # audio TX (file/URL → GStreamer → RTP)
-└── protocol/           # RTC_TOPIC, SPORT_CMD, AUDIO_API, DATA_CHANNEL_TYPE constants
-```
+## Composition and dependencies
 
-### 4.2 옵션 C 상세 설계 근거
-
-#### `connection/` — 독립 모듈
-
-Connection은 **모든 기능의 전제조건**이며, 독자적인 lifecycle을 가짐:
-- `connect()` → signaling → SDP exchange → DataChannel open
-- `disconnect()` → intentional close
-- `reconnect()` → close + re-connect
-- `auto_reconnect(max_retries)` → exponential backoff loop
-
-```python
-# connection/
-#   __init__.py
-#   connection.py      → UnitreeConnection  (connect, disconnect, reconnect, auto_reconnect)
-#   signaling.py       → (내부) HTTP signaling wrapper
-#   types.py           → ConnectionMethod enum, ConnectionState
+```text
+Python application                         Native Rust consumer
+       |                                           |
+interface/bridges + callbacks                       |
+       +-------------------+-----------------------+
+                           v
+             connection::UnitreeSession
+             session.rs: composition/resource owner
+             lifecycle.rs: validated connect/reset/rollback
+                           |
+           +---------------+----------------+
+           v                                v
+  ConnectionService                 DataChannelService
+  transport establishment           framing/router/chunks/RPC/heartbeat
+           |                                |
+           +------ protocol/ports ----------+
+                      ^ implementations
+                      |
+        infrastructure: HTTP signaling + RTC engine
+                      |
+       WebRTC datachannel and audio/video tracks
 ```
 
-#### `datachannel/core/` — 공용 메시징 인프라
+- [connection/session.rs](../src/connection/session.rs) assembles signaling/RTC adapters, ingress and callback channels, LiDAR workers and audio playback ownership. `UnitreeSession::new` selects concrete adapters; `with_adapters` accepts offline/custom ports. Both return the session and its owned event receiver.
+- [protocol/](../src/protocol/) defines ports, constants, wire/ingress models and callback events without PyO3, GStreamer or HTTP implementation dependencies. [infrastructure/](../src/infrastructure/) implements signaling/security, RTC setup/handlers, outbound sending and tracked peer cleanup. This is not a claim that every module is framework-independent: core validation reuses the security helper, and media handlers/codecs use WebRTC/GStreamer types.
+- [datachannel/core/](../src/datachannel/core/) owns routing, validation, heartbeat, subscriptions and request completion. `framing.rs` parses the existing binary layouts; `chunks.rs` owns bounded chunk assembly. These are not application-specific sport/SLAM services.
+- [datachannel/lidar/](../src/datachannel/lidar/) owns compressed-job scheduling and native decoding. [video/](../src/video/) owns H.264 assembly/decode; [audio/receive/](../src/audio/receive/) owns Opus receive and [audio/transmit/](../src/audio/transmit/) owns playback/encoding/RTP production.
+- [interface/](../src/interface/) marshals the Python API, aliases, inputs/errors and callbacks. It delegates session policy to Rust instead of maintaining another transport implementation.
 
-DataChannel의 **validation, heartbeat, pub/sub 메커니즘**은 모든 datachannel 기능이 공유:
+## Dataflow, ownership and lifecycle
 
-```python
-# datachannel/core/
-#   pub_sub.py          → PubSub  (subscribe, unsubscribe, publish, publish_request_new)
-#   message_types.py    → DataChannelMessageType enum
-```
+RTC ingress carries an epoch captured when the peer handler is created. The core rejects stale ingress under the same synchronization boundary as reset. Topic messages become callback events; compressed LiDAR jobs pass through the worker pool; audio/video tracks pass through their codecs. All callback producers retain the epoch of the work they received, rather than relabeling old work with the current session.
 
-#### `datachannel/sport/` — Sport Mode 명령
+[protocol/events.rs](../src/protocol/events.rs) admits owned callback buffers into separate control/media count and byte quotas. The Python dispatcher retains the admission permit through attachment/conversion/callback handling and rechecks the epoch before callback admission. Native receiver methods transfer event ownership and release the permit; user-retained buffers/NumPy arrays are outside the quota. Admission uses synchronization, not a lock-free guarantee. Control-first callback selection does not guarantee control delivery through the shared ingress queue.
 
-Sport Mode는 **특정 topic(`rt/api/sport/request`)에 특정 패턴(`api_id` + `parameter`)으로 publish**하는 것:
+The RTC adapter owns a bounded outbound command worker. Successful enqueue means local acceptance, not wire completion or a robot acknowledgement; a send already in progress cannot be recalled. Pending request admission, response correlation, cancellation and reset belong to the core. Exact bounds, overflow behavior and sticky failure paths are documented in [resource policy](engineering/resource-policy.md#named-safety-policies).
 
-```python
-# datachannel/sport/
-#   commands.py         → SportCommand enum (StandUp=1004, Hello=1016, ...)
-#   sport_client.py     → SportClient (send_command, get_state, move, euler, ...)
-```
+Connect/reconnect/disconnect and concrete audio playback share the Rust lifecycle owner. UnitreeSession readiness requires peer validation as well as transport establishment; the low-level `ConnectionService::is_connected` reports completion of transport establishment, not live validated readiness. Disconnect invalidates active/queued connection attempts, fails pending requests, clears retained chunk assembly and invalidates stale callback/decode work by epoch. It retains reusable queues/workers and the event receiver for reconnect. Await disconnect while the Tokio runtime remains alive: final owner drop stops core work and schedules best-effort asynchronous transport cleanup, not a guaranteed async join. Python children retain the complete session owner; a raw Rust datachannel handle alone does not own a validated session. An already-admitted Python callback may finish after reset.
 
-#### `datachannel/state/` vs `datachannel/lidar/` — 왜 분리?
+## Language and buffer boundary
 
-| 비교 항목 | State | LiDAR |
-|---|---|---|
-| Transport | subscribe (text JSON) | subscribe (binary + LZ4) |
-| 디코딩 | JSON parse only | LZ4 decompress → bit-unpack → NumPy |
-| 스레드 | DC Router → Dispatcher | DC Router → **Worker Pool** → Dispatcher |
-| 데이터 크기 | 수 KB | 수십~수백 KB (28.8k points/frame) |
-| 스로틀링 | 없음 | 15 FPS 제한 |
-| 디코더 선택 | 없음 | `native` only |
+Python is an optional default feature; extension builds enable `extension-module`, while `--no-default-features` excludes PyO3/NumPy and Python build helpers. Native consumers still require the GStreamer/Opus system dependencies; this is not a browser/WASM backend.
 
-**결론: State와 LiDAR는 같은 subscribe 메커니즘을 사용하지만, 데이터 처리 파이프라인이 완전히 다르므로 분리가 맞음.**
+Rust owns network parsing, codecs, worker queues and media buffers. Python access/conversion and callbacks attach to Python; callback-registry locks are released before user code runs. NumPy receives owned LiDAR `float32 (N, 3)`, BGR video `uint8 (H, W, 3)` and interleaved audio `int16 (samples,)` arrays. The owned Rust buffer → NumPy handoff avoids copying at that boundary; parsing, decompression, decoding and stride repacking may still allocate/copy. No end-to-end zero-copy or free-threaded Python safety claim follows.
 
-```python
-# datachannel/state/
-#   subscriptions.py    → StateSubscriber (sport_mode_state, low_state, etc.)
-#   models.py           → SportModeState, LowState 등 typed models
+## Migrating to 0.3
 
-# datachannel/lidar/
-#   lidar_client.py     → LidarClient (switch, subscribe, set_decoder)
-#   models.py           → LidarFrame (points: ndarray, metadata)
-```
+Python imports, legacy aliases, valid wire fields/command IDs and callback values remain compatible; malformed/ambiguous inputs now fail explicitly. The shipped Python typing source is the root [unitree_webrtc_rs.pyi](../unitree_webrtc_rs.pyi); unused duplicate Python helpers/stubs were removed. Example CLI changes are intentional and documented in [README examples](../README.md#examples).
 
-#### `video/` & `audio/` — Media Track 기반 독립
+Rust source consumers must update ingress adapters for `IngressMessage` and fallible epoch setup, use the event sender/receiver wrappers instead of raw callback channels, handle local `TransportFault`/readiness variants in exhaustive matches, and handle the fallible LiDAR point decoder. Prefer public `UnitreeSession` for shared validated lifecycle/resource ownership. Consult the [complete migration and buffer contracts](engineering/resource-policy.md#compatibility-and-buffer-contracts) before updating external adapters; wrappers do not emulate every crossbeam API.
 
-Video와 Audio는 **WebRTC media track**으로 수신하며, DataChannel과는 완전 별개 경로:
+## Practical extension seams
 
-```python
-# video/
-#   video_receiver.py   → VideoReceiver (on_frame, switch_channel)
+| Change | Existing seam and evidence required |
+| --- | --- |
+| New topic or command helper | Reuse core pub/sub/request operations and canonical protocol constants. Establish the actual topic/schema/API ID and sanitized positive/error fixtures; do not duplicate framing or session policy. |
+| Another firmware or robot model | Compare signaling/auth, topics, codecs and capabilities against sourced firmware/model evidence. Keep proven differences at adapter/composition boundaries; reject unknown capabilities rather than silently sending Go2 commands. Upstream Python support alone is not Rust or hardware support. |
+| Another native language binding | Consume `UnitreeSession` and owned events; add only language-specific conversion, lifetime and typing contracts. No Node binding or universal wrapper package is currently implemented. |
+| Media or performance change | Extend the owning codec/worker, retain input/resource bounds and terminal error behavior, and add focused fixtures. Measure latency, retained memory and drops before claiming an improvement or changing budgets. |
 
-# audio/
-#   receive/
-#     audio_receiver.py → AudioReceiver (on_audio, switch_channel)
-#   transmit/
-#     audio_sender.py   → AudioSender (play_from_file, play_from_url, stop)
-```
+Do not create speculative sport/state/SLAM/UWB/arm packages or a profile/plugin registry just because a topic exists. A second verified implementation or actual caller need should drive that boundary. Multi-model support and fleet scale are separate problems: per-session safety ceilings do not establish whole-process memory or multi-robot latency guarantees.
 
-Audio TX/RX를 분리하는 이유: RX는 track callback이고 TX는 GStreamer 파이프라인으로 완전히 다른 구현.
+## Verification boundaries
 
-#### `protocol/` — 프로토콜 상수 집중
-
-```python
-# protocol/
-#   topics.py           → RTC_TOPIC dict
-#   sport_commands.py   → SPORT_CMD dict
-#   audio_api.py        → AUDIO_API dict
-#   channel_types.py    → DATA_CHANNEL_TYPE dict
-#   errors.py           → APP_ERROR_MESSAGES dict
-#   vui_colors.py       → VUI_COLOR
-```
-
----
-
-## 5. 확장성 설계
-
-### 5.1 새 DataChannel 기능 추가 시
-
-새로운 토픽 그룹 (예: SLAM)을 추가할 때:
-
-```
-datachannel/
-├── core/                # ← 변경 없음
-├── sport/               # ← 변경 없음
-├── state/               # ← 변경 없음
-├── lidar/               # ← 변경 없음
-└── slam/                # ← 새 폴더만 추가
-    ├── __init__.py
-    ├── slam_client.py   # subscribe("rt/uslam/*"), send commands
-    └── models.py        # SlamOdom, CloudPoint, GlobalPath 등
-```
-
-**영향 범위**: 새 폴더 하나 추가 + `protocol/topics.py`에 이미 정의된 상수 사용. 기존 코드 변경 없음.
-
-### 5.2 미사용 토픽 → 모듈 매핑
-
-| 미래 모듈 | 사용할 토픽 | 구현 패턴 |
-|---|---|---|
-| `datachannel/slam/` | `SLAM_*`, `LIDAR_MAPPING_*`, `LIDAR_LOCALIZATION_*`, `LIDAR_NAVIGATION_*` | subscribe + command publish |
-| `datachannel/uwb/` | `UWB_REQ`, `UWB_STATE` | request + subscribe |
-| `datachannel/vui/` | `VUI` | request (api_id pattern) |
-| `datachannel/obstacles/` | `OBSTACLES_AVOID` | request |
-| `datachannel/arm/` | `ARM_COMMAND`, `ARM_FEEDBACK` | publish + subscribe |
-| `datachannel/gas/` | `GAS_SENSOR`, `GAS_SENSOR_REQ` | request + subscribe |
-| `datachannel/grid_map/` | `GRID_MAP` | subscribe |
-| `datachannel/bash/` | `BASH_REQ` | request |
-| `datachannel/motion/` | `MOTION_SWITCHER` | request |
-
----
-
-## 6. Rust → Python 매핑: 현재 vs 제안
-
-### 현재 (단일 py_api.rs에 모든 것)
-
-```python
-conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="...")
-await conn.connect()
-conn.datachannel.pub_sub.subscribe(topic, callback)     # 모든 subscribe가 같은 경로
-conn.datachannel.pub_sub.publish_request_new(topic, {})  # 모든 publish가 같은 경로
-conn.video.on_frame(callback)
-conn.audio.on_audio(callback)
-```
-
-### 제안: Rust PyO3 클래스는 유지, Python wrapper로 상위 추상화
-
-```python
-# 현재 Rust API는 그대로 유지 (breaking change 없음)
-# Python 측에서 feature-oriented wrapper 추가
-
-from unitree_webrtc_rs.sport import SportClient
-from unitree_webrtc_rs.state import StateSubscriber
-from unitree_webrtc_rs.lidar import LidarClient
-
-conn = UnitreeWebRTCConnection(...)
-await conn.connect()
-
-sport = SportClient(conn)           # conn.datachannel.pub_sub 을 내부적으로 사용
-await sport.stand_up()
-await sport.hello()
-state = await sport.get_state()
-
-subscriber = StateSubscriber(conn)  # subscribe wrapper
-subscriber.on_sport_mode_state(callback)
-subscriber.on_low_state(callback)
-
-lidar = LidarClient(conn)           # lidar-specific wrapper
-lidar.enable()
-lidar.set_decoder("native")
-lidar.on_points(callback)
-```
-
-> [!IMPORTANT]
-> **핵심 원칙**: Rust PyO3 바인딩(현재 `py_api.rs`)은 변경하지 않음. Python thin wrapper 레이어를 추가하여 feature-oriented API를 제공. backward compatibility 100% 유지.
-
----
-
-## 7. 요약: Rust 구조 vs Python 구조
-
-| Rust (Internal) | Python (User-facing) | 이유 |
-|---|---|---|
-| `connection_service.rs` | `connection/` | 1:1 대응 |
-| `datachannel_service.rs` (1153 lines) | `datachannel/core/` + `sport/` + `state/` + `lidar/` + ... | 단일 거대 서비스를 도메인별로 분할 |
-| `video_service.rs` | `video/` | 1:1 대응 |
-| `audio_service.rs` | `audio/receive/` | 1:1 대응 |
-| `audio_sender_service.rs` | `audio/transmit/` | 1:1 대응 |
-| `lidar_service.rs` + `lidar_codec.rs` | `datachannel/lidar/` | Rust에서는 infra+app 분리, Python에서는 기능 단위 |
-| `constants.rs` | `protocol/` | 상수를 카테고리별 파일로 분리 |
-
----
-
-## 8. 체계적 오픈소스 프로젝트를 위한 추가 권장사항
-
-### 8.1 README 기능 매트릭스
-현재 README의 Feature 테이블과 Project Structure를 제안된 구조로 업데이트하면, 프로젝트에 어떤 기능이 있는지 폴더 레벨로 즉시 파악 가능.
-
-### 8.2 Examples 폴더 구조
-```
-examples/
-├── connection/
-│   └── connect.py
-├── sport/
-│   ├── sport_mode.py
-│   └── sport_mode_state.py
-├── lidar/
-│   ├── lidar_stream.py
-│   └── lidar_test.py
-├── video/
-│   └── video_stream.py
-├── audio/
-│   ├── audio_receive.py
-│   ├── audio_play_file.py
-│   └── audio_stream_url.py
-└── integration/
-    └── integration.py
-```
-
-### 8.3 타입 안전성
-Python wrapper에서 `TypedDict` 또는 `dataclass`로 state/lidar 등의 데이터 모델을 정의하면, IDE 자동완성 + 문서화에 유리.
-
-### 8.4 Plugin/Extension 패턴
-향후 사용자가 커스텀 토픽 핸들러를 등록할 수 있도록:
-```python
-conn.datachannel.register_handler("rt/custom/topic", CustomHandler())
-```
-이 패턴은 `datachannel/core/` 에 한 번 구현하면, 모든 도메인 모듈이 재사용 가능.
+Use [CONTRIBUTING](../CONTRIBUTING.md#setup-and-verification) for applicable regression/native/packaging checks and [README validation scope](../README.md#validation-scope) for bounded hardware observations and unresolved ICE behavior. A build, mock test, queue admission or RPC ACK does not establish physical success. Remote signaling, broad platform/model support, long-running fleet/stress behavior and independent audio validation remain outside the demonstrated scope.

@@ -1,39 +1,17 @@
-## Description
-<!-- Please include a summary of the change and which issue is fixed. Please also include relevant motivation and context. -->
-<!-- Explain what you did and why it's necessary. -->
+## Outcome
 
-- Fixes GitHub Issue # (issue)
-- Jira Task: [TASK-NUMBER](https://jira.yourdomain.com/browse/TASK-NUMBER)
+<!-- What changed, why it is necessary, and what stayed out of scope. Link a real issue only when one exists. -->
 
-## Type of change
-<!-- Please delete options that are not relevant. -->
+## Contracts and migration
 
-- [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] This change requires a documentation update
-- [ ] Code refactoring / Cleanup
-- [ ] CI/CD or Build system changes
+<!-- Affected callers, Python aliases/stubs, Rust APIs, wire/data shapes, resource/lifecycle policies; intentional changes and migration. Use “none” when appropriate. -->
 
-## How Has This Been Tested?
-<!-- Please describe the tests that you ran to verify your changes. Provide instructions so we can reproduce. -->
-<!-- Examples: 
-- Ran `cargo test` and `cargo fmt`
-- Tested on Jetson Orin Nano (Ubuntu 22.04)
-- Verified WebRTC stream on macOS Chrome
--->
+## Verification
 
-- [ ] Test A
-- [ ] Test B
+| Exact command / check | Result | Evidence scope |
+| --- | --- | --- |
+| | | Static / mock / native / packaging / deployed / physical |
 
-## Checklist:
-<!-- Go over all the following points, and put an `x` in all the boxes that apply. -->
-<!-- If you're unsure about any of these, don't hesitate to ask. We're here to help! -->
+## Limits and risks
 
-- [ ] I have performed a self-review of my own code
-- [ ] I have commented my code, particularly in hard-to-understand areas
-- [ ] I have made corresponding changes to the documentation
-- [ ] My changes generate no new warnings (e.g., `cargo clippy`)
-- [ ] I have added tests that prove my fix is effective or that my feature works
-- [ ] New and existing unit tests pass locally with my changes
-- [ ] Any dependent changes have been merged and published in downstream modules
+<!-- Name omitted/failed checks, unsupported environments/models, hardware/performance gaps and rollback considerations. Do not treat build/ACK/simulation as physical validation. -->

@@ -20,10 +20,17 @@ repos:
         language: system
         types: [rust]
         args: ["--all", "--", "--check"]
+  - repo: local
+    hooks:
       - id: clippy
-        name: cargo clippy
-        description: Lint rust code.
-        entry: cargo clippy
+        name: cargo clippy (locked project Python)
+        entry: make check-rust-lint
         language: system
         types: [rust]
-        args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
+        pass_filenames: false
+      - id: guidance
+        name: pinned guidance metadata, hashes and links
+        entry: make check-guidance
+        language: system
+        files: ^(AGENTS\.md$|README\.md$|CONTRIBUTING\.md$|docs/|\.github/.*\.md$|\.agents/|scripts/check-guidance\.py$)
+        pass_filenames: false

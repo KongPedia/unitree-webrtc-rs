@@ -3,15 +3,9 @@ use opus::{Channels, Decoder, Encoder};
 pub struct OpusDecoder {
     decoder: Decoder,
     pcm_buffer: Vec<i16>,
+    sample_rate: u32,
+    channels: u16,
 }
-
-// SAFETY: OpusDecoder is Send because:
-// 1. The opus::Decoder is a stateful decoder that maintains internal state
-// 2. This decoder is ONLY used within a single tokio task (spawn_audio_handler) and never
-//    shared across threads - it's a single-owner pattern
-// 3. The pcm_buffer is an owned Vec<i16> which is Send
-// 4. No interior mutability or shared references exist that would violate Send
-unsafe impl Send for OpusDecoder {}
 
 impl OpusDecoder {
     pub fn new(sample_rate: u32, channels: u16) -> Result<Self, String> {
@@ -24,12 +18,14 @@ impl OpusDecoder {
         let decoder = Decoder::new(sample_rate, ch)
             .map_err(|e| format!("Failed to create Opus decoder: {}", e))?;
 
-        // Pre-allocate buffer for 960 samples stereo (typical Opus frame @ 48kHz)
-        let pcm_buffer = vec![0i16; 960 * 2];
+        // Opus permits up to 120 ms per packet, counted per channel.
+        let pcm_buffer = vec![0i16; (sample_rate as usize * 120 / 1000) * channels as usize];
 
         Ok(Self {
             decoder,
             pcm_buffer,
+            sample_rate,
+            channels,
         })
     }
 
@@ -37,15 +33,9 @@ impl OpusDecoder {
         if opus_data.is_empty() {
             return Ok(DecodedAudio {
                 data: Vec::new(),
-                sample_rate: 48000,
-                channels: 2,
+                sample_rate: self.sample_rate,
+                channels: self.channels,
             });
-        }
-
-        // Resize buffer if needed (max 120ms @ 48kHz stereo)
-        let max_samples = 5760 * 2;
-        if self.pcm_buffer.len() < max_samples {
-            self.pcm_buffer.resize(max_samples, 0);
         }
 
         // Decode Opus packet to PCM
@@ -55,14 +45,13 @@ impl OpusDecoder {
             .decode(opus_data, &mut self.pcm_buffer, false)
             .map_err(|e| format!("Opus decode error: {}", e))?;
 
-        // For stereo, actual i16 count = samples * 2 (interleaved L/R)
-        let actual_i16_count = decoded_samples * 2;
+        let actual_i16_count = decoded_samples * self.channels as usize;
         let data = self.pcm_buffer[..actual_i16_count].to_vec();
 
         Ok(DecodedAudio {
             data,
-            sample_rate: 48000,
-            channels: 2,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
         })
     }
 }
@@ -77,13 +66,6 @@ pub struct OpusEncoder {
     encoder: Encoder,
     opus_buffer: Vec<u8>,
 }
-
-// SAFETY: OpusEncoder is Send because:
-// 1. The opus::Encoder is a stateful encoder that maintains internal state
-// 2. This encoder is currently unused but designed for single-owner pattern usage
-// 3. The opus_buffer is an owned Vec<u8> which is Send
-// 4. No interior mutability or shared references exist that would violate Send
-unsafe impl Send for OpusEncoder {}
 
 impl OpusEncoder {
     #[allow(dead_code)]
@@ -120,5 +102,30 @@ impl OpusEncoder {
 
         // Extract only the encoded bytes
         Ok(self.opus_buffer[..encoded_len].to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_preserves_supported_rates_channels_and_sample_count() {
+        for sample_rate in [8000, 12000, 16000, 24000, 48000] {
+            for channels in [1, 2] {
+                let sample_count = sample_rate as usize / 50 * channels as usize;
+                let mut encoder = OpusEncoder::new(sample_rate, channels).unwrap();
+                let packet = encoder.encode(&vec![0; sample_count]).unwrap();
+                let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+                let decoded = decoder.decode(&packet).unwrap();
+                assert_eq!(
+                    (decoded.sample_rate, decoded.channels),
+                    (sample_rate, channels)
+                );
+                assert_eq!(decoded.data.len(), sample_count);
+                let empty = decoder.decode(&[]).unwrap();
+                assert_eq!((empty.sample_rate, empty.channels), (sample_rate, channels));
+            }
+        }
     }
 }

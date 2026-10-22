@@ -1,42 +1,53 @@
 #!/bin/bash
 
-# Version synchronization script for unitree-webrtc-rs
+# Update project versions and refresh existing locks without upgrading dependencies.
 # Usage: ./scripts/sync-version.sh 0.2.0
+set -euo pipefail
 
-set -e
-
+if [[ $# -ne 1 || ! ${1:-} =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "Error: Supply one semantic version (e.g., 0.2.0)" >&2
+    exit 1
+fi
 NEW_VERSION="$1"
 
-if [ -z "$NEW_VERSION" ]; then
-    echo "❌ Error: Version argument required"
-    echo "Usage: $0 0.2.0"
+backup=$(mktemp -d)
+cp Cargo.toml pyproject.toml Cargo.lock uv.lock "$backup/" || {
+    rm -rf "$backup"
     exit 1
-fi
+}
 
-# Validate version format (semver)
-if ! echo "$NEW_VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' > /dev/null; then
-    echo "❌ Error: Invalid version format. Use semantic versioning (e.g., 0.2.0)"
-    exit 1
-fi
+cleanup() {
+    status=$?
+    trap - EXIT
+    if [[ $status -ne 0 ]]; then
+        # A failed lock refresh must not leave a partially bumped release.
+        cp "$backup/Cargo.toml" "$backup/pyproject.toml" "$backup/Cargo.lock" "$backup/uv.lock" .
+    fi
+    rm -rf "$backup"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-echo "🔄 Syncing version to $NEW_VERSION..."
+update_version() {
+    awk -v section="$2" -v version="$NEW_VERSION" '
+        /^\[/ { in_section = ($0 == "[" section "]") }
+        in_section && /^[[:space:]]*version[[:space:]]*=/ {
+            $0 = "version = \"" version "\""
+            count++
+        }
+        { print }
+        END { if (count != 1) exit 1 }
+    ' "$1" > "$backup/updated"
+    cat "$backup/updated" > "$1"
+}
 
-# Update Cargo.toml
-sed -i.bak "s/^version = .*/version = \"$NEW_VERSION\"/" Cargo.toml
-rm Cargo.toml.bak
+echo "Syncing version to $NEW_VERSION..."
+update_version Cargo.toml package
+update_version pyproject.toml project
+uv lock
+cargo update --workspace
 
-# Update pyproject.toml  
-sed -i.bak "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
-rm pyproject.toml.bak
-
-echo "✅ Version synchronized:"
-echo "   Cargo.toml:    $(grep '^version = ' Cargo.toml)"
-echo "   pyproject.toml: $(grep '^version = ' pyproject.toml)"
-
-echo ""
-echo "🎯 Next steps:"
-echo "   make deploy    # Build for release"
-echo "   git add ."
-echo "   git commit -m \"v$NEW_VERSION\""
-echo "   git tag v$NEW_VERSION"
-echo "   git push origin v$NEW_VERSION"
+echo "Version synchronized to $NEW_VERSION in manifests and lockfiles."
+echo "Review the four-file diff, then use make deploy to build for release."

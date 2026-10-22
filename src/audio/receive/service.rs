@@ -1,31 +1,36 @@
 use super::codec::OpusDecoder;
+use crate::diagnostics::RepeatLog;
+use crate::protocol::events::EventSender;
 use crate::protocol::models::CallbackEvent;
-use crossbeam_channel::Sender;
+use crossbeam_channel::TrySendError;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, error, warn};
 use webrtc::track::track_remote::TrackRemote;
 
-pub fn spawn_audio_handler(track: Arc<TrackRemote>, callback_tx: Sender<CallbackEvent>) {
+pub fn spawn_audio_handler(
+    track: Arc<TrackRemote>,
+    callback_tx: EventSender,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        info!(
+        debug!(
             event = "audio_handler_start",
             ssrc = track.ssrc(),
-            codec = %track.codec().capability.mime_type,
             "Starting audio RTP handler"
         );
 
         let mut decoder = match OpusDecoder::new(48000, 2) {
             Ok(d) => d,
-            Err(e) => {
-                warn!(
+            Err(_) => {
+                error!(
                     event = "audio_decoder_init_failed",
-                    error = %e,
                     "Failed to initialize Opus decoder"
                 );
                 return;
             }
         };
 
+        let frame_drops = RepeatLog::new("audio_frame_drop", "callback_queue_full");
+        let decode_errors = RepeatLog::new("audio_decode_error", "invalid_opus_packet");
         let mut rtp_buffer = vec![0u8; 1500];
         let mut frame_count = 0u64;
 
@@ -46,28 +51,25 @@ pub fn spawn_audio_handler(track: Arc<TrackRemote>, callback_tx: Sender<Callback
                                     channels: decoded_audio.channels,
                                 };
 
-                                if let Err(e) = callback_tx.try_send(event) {
-                                    warn!(
-                                        event = "audio_frame_drop",
-                                        error = %e,
-                                        "Failed to send audio frame to callback queue"
-                                    );
+                                match callback_tx.try_send(event) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => frame_drops.record(),
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        error!(
+                                            event = "audio_callback_closed",
+                                            "Stopping audio stream"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                event = "audio_decode_error",
-                                error = %e,
-                                "Failed to decode Opus packet"
-                            );
-                        }
+                        Err(_) => decode_errors.record(),
                     }
                 }
-                Err(e) => {
+                Err(_) => {
                     warn!(
                         event = "audio_rtp_read_error",
-                        error = %e,
                         "Failed to read RTP packet from audio track"
                     );
                     break;
@@ -75,10 +77,10 @@ pub fn spawn_audio_handler(track: Arc<TrackRemote>, callback_tx: Sender<Callback
             }
         }
 
-        info!(
+        debug!(
             event = "audio_handler_stop",
             total_frames = frame_count,
             "Audio RTP handler stopped"
         );
-    });
+    })
 }

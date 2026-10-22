@@ -7,14 +7,18 @@ from unitree_webrtc_rs import UnitreeWebRTCConnection, WebRTCConnectionMethod
 
 async def main():
     parser = argparse.ArgumentParser(description="Stream internet radio to Go2")
-    parser.add_argument("--ip", type=str, default="10.2.80.101", help="Robot IP address")
+    parser.add_argument(
+        "--ip", type=str, default="10.2.80.101", help="Robot IP address"
+    )
     parser.add_argument(
         "--url",
         type=str,
         default="https://nashe1.hostingradio.ru:80/ultra-128.mp3",
         help="Audio stream URL",
     )
-    parser.add_argument("--duration", type=float, default=30.0, help="Playback duration in seconds")
+    parser.add_argument(
+        "--duration", type=float, default=30.0, help="Playback duration in seconds"
+    )
     args = parser.parse_args()
 
     print(f"Connecting to robot at {args.ip}...")

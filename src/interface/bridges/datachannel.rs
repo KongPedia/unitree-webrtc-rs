@@ -1,7 +1,8 @@
+use crate::connection::UnitreeSession;
 use crate::datachannel::DataChannelService;
 use crate::infrastructure::rtc_engine::RtcEngine;
 use crate::interface::bridges::pubsub::{CallbackRegistry, PyPubSubBridge};
-use crate::interface::utils::to_py_error;
+use crate::interface::utils::{to_py_error, with_session_owner};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use std::sync::Arc;
 pub struct PyDataChannelBridge {
     pub service: Arc<DataChannelService<RtcEngine>>,
     pub callback_registry: CallbackRegistry,
+    pub _session: Arc<UnitreeSession>,
 }
 
 #[pymethods]
@@ -20,6 +22,7 @@ impl PyDataChannelBridge {
             PyPubSubBridge {
                 service: Arc::clone(&self.service),
                 callback_registry: Arc::clone(&self.callback_registry),
+                _session: Arc::clone(&self._session),
             },
         )
     }
@@ -32,12 +35,16 @@ impl PyDataChannelBridge {
         switch: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let service = Arc::clone(&self.service);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            service
-                .disable_traffic_saving(switch)
-                .await
-                .map_err(to_py_error)
-        })
+        let session = Arc::clone(&self._session);
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            with_session_owner(session, async move {
+                service
+                    .disable_traffic_saving(switch)
+                    .await
+                    .map_err(to_py_error)
+            }),
+        )
     }
 
     #[pyo3(name = "switchVideoChannel")]
