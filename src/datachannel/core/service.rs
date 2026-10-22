@@ -14,6 +14,7 @@ use bytes::Bytes;
 use chrono::Local;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -678,14 +679,14 @@ where
                 Ok(parsed) => {
                     self.run_resolve(&parsed);
                     self.handle_text_response(&parsed);
-                    self.dispatch_subscription(&parsed);
+                    self.dispatch_subscription(parsed);
                 }
                 Err(_) => self.diagnostics.parse.record(),
             },
             DcMessage::Binary(binary) => {
                 if let Some(parsed) = self.deal_array_buffer(&binary) {
                     self.run_resolve(&parsed);
-                    self.dispatch_subscription(&parsed);
+                    self.dispatch_subscription(parsed);
                 }
             }
         }
@@ -700,7 +701,7 @@ where
             return;
         }
 
-        self.resolve_pending_response(&Self::incoming_key(message), message.clone());
+        self.resolve_pending_response(&Self::incoming_key(message), Cow::Borrowed(message));
     }
 
     fn handle_chunked_response(&self, message: &Value) -> bool {
@@ -750,7 +751,7 @@ where
                 *merged
                     .pointer_mut(path)
                     .expect("validated chunk payload path") = Self::bytes_to_json_array(&bytes);
-                self.resolve_pending_response(&key, merged);
+                self.resolve_pending_response(&key, Cow::Owned(merged));
             }
             Ok(None) => {}
             Err(error) => {
@@ -909,7 +910,7 @@ where
         );
     }
 
-    fn dispatch_subscription(&self, message: &Value) {
+    fn dispatch_subscription(&self, message: Value) {
         let topic = message
             .get("topic")
             .and_then(Value::as_str)
@@ -933,7 +934,7 @@ where
 
         let event = CallbackEvent::TopicCallback {
             topic: topic.to_string(),
-            payload: message.clone(),
+            payload: message,
         };
 
         if self
@@ -1217,7 +1218,7 @@ where
         self.chunk_data_storage.lock().unwrap().remove(key);
     }
 
-    fn resolve_pending_response(&self, key: &str, message: Value) {
+    fn resolve_pending_response(&self, key: &str, message: Cow<'_, Value>) {
         let callback = {
             let mut pending = self.pending_callbacks.lock().unwrap();
             pending.remove(key)
@@ -1231,7 +1232,10 @@ where
         let result = if callback.session_id != current_session {
             Err("Response belongs to a stale DataChannel session".to_string())
         } else {
-            callback.expectation.validate(&message).map(|_| message)
+            callback
+                .expectation
+                .validate(&message)
+                .map(|_| message.into_owned())
         };
 
         let _ = callback.sender.send(result);
@@ -1923,6 +1927,7 @@ mod tests {
         service.subscribe("errors").unwrap();
         let secret = "sentinel-private-key".repeat(1024);
         let message = json!({"type": "errors", "topic": "errors", "data": [secret]});
+        let expected = message.clone();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&bytes);
         let subscriber = tracing_subscriber::fmt()
@@ -1932,7 +1937,7 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             service.handle_error_message(&message);
-            service.dispatch_subscription(&message);
+            service.dispatch_subscription(message);
         });
         let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         assert!(log.contains("ERROR"));
@@ -1941,7 +1946,7 @@ mod tests {
         assert!(log.contains("error_count=1"));
         assert!(log.len() < 512);
         assert!(
-            matches!(callback_rx.try_recv().unwrap(), CallbackEvent::TopicCallback { payload, .. } if payload == message)
+            matches!(callback_rx.try_recv().unwrap(), CallbackEvent::TopicCallback { payload, .. } if payload == expected)
         );
     }
 
@@ -1989,6 +1994,142 @@ mod tests {
             generation: Arc::clone(&service.session_id),
         };
         (service, channel, sender, cb_rx)
+    }
+
+    #[test]
+    fn subscription_moves_original_json_allocation_with_or_without_waiter() {
+        for has_waiter in [false, true] {
+            let (service, _channel, _ingress, events) = make_service("open");
+            service.subscribe("topic").unwrap();
+            let message = json!({"type":"res", "topic":"topic", "data":"owned-payload"});
+            let original = message["data"].as_str().unwrap().as_ptr();
+            let mut response = has_waiter.then(|| {
+                let (sender, receiver) = oneshot::channel();
+                service.pending_callbacks.lock().unwrap().insert(
+                    DataChannelService::<MockDataChannel>::incoming_key(&message),
+                    PendingCallback {
+                        token: Arc::new(()),
+                        sender,
+                        expectation: ResponseExpectation::any(),
+                        session_id: service.session_id.load(Ordering::Relaxed),
+                    },
+                );
+                receiver
+            });
+            service.run_resolve(&message);
+            let resolved = response.as_mut().map(|rx| rx.try_recv().unwrap().unwrap());
+            if let Some(resolved) = &resolved {
+                assert_eq!(resolved, &message);
+                assert_ne!(resolved["data"].as_str().unwrap().as_ptr(), original);
+            }
+            service.dispatch_subscription(message);
+            let CallbackEvent::TopicCallback { payload, .. } = events.try_recv().unwrap() else {
+                panic!("expected topic callback");
+            };
+            assert_eq!(payload["data"], "owned-payload");
+            assert_eq!(payload["data"].as_str().unwrap().as_ptr(), original);
+        }
+    }
+
+    #[test]
+    fn owned_pending_response_preserves_json_allocation() {
+        let (service, _channel, _ingress, _events) = make_service("open");
+        let message = json!({"type":"res", "topic":"topic", "data":"merged-payload"});
+        let original = message["data"].as_str().unwrap().as_ptr();
+        let key = DataChannelService::<MockDataChannel>::incoming_key(&message);
+        let (sender, mut response) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            key.clone(),
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        service.resolve_pending_response(&key, Cow::Owned(message));
+        let resolved = response.try_recv().unwrap().unwrap();
+        assert_eq!(resolved["data"].as_str().unwrap().as_ptr(), original);
+    }
+
+    #[test]
+    fn subscription_quota_failure_does_not_prevent_pending_completion() {
+        let (service, _channel, _ingress, events) = make_service("open");
+        service.subscribe("topic").unwrap();
+        let message = json!({"type":"res", "topic":"topic", "data":"payload"});
+        for _ in 0..64 {
+            service.dispatch_subscription(message.clone());
+        }
+        let (sender, mut response) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            DataChannelService::<MockDataChannel>::incoming_key(&message),
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        service.process_ingress(
+            DcMessage::Text(message.to_string())
+                .for_generation(service.session_id.load(Ordering::Relaxed)),
+        );
+        assert_eq!(response.try_recv().unwrap().unwrap(), message);
+        for _ in 0..64 {
+            assert!(events.try_recv().is_ok());
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn chunk_waiter_merges_but_subscriber_receives_original_chunks_in_both_schemas() {
+        for file_schema in [false, true] {
+            let (service, _channel, _ingress, events) = make_service("open");
+            service.subscribe("topic").unwrap();
+            let mut first = json!({"type":"res", "topic":"topic"});
+            let metadata = json!({"enable_chunking":true,"chunk_index":1,"total_chunk_num":2});
+            let (index_path, payload_path) = if file_schema {
+                first["info"] = json!({"file":metadata});
+                first["info"]["file"]["data"] = json!([65]);
+                ("/info/file/chunk_index", "/info/file/data")
+            } else {
+                first["data"] = json!({"content_info":metadata,"data":[65]});
+                ("/data/content_info/chunk_index", "/data/data")
+            };
+            let (sender, mut response) = oneshot::channel();
+            service.pending_callbacks.lock().unwrap().insert(
+                DataChannelService::<MockDataChannel>::incoming_key(&first),
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender,
+                    expectation: ResponseExpectation::any(),
+                    session_id: service.session_id.load(Ordering::Relaxed),
+                },
+            );
+            let mut second = first.clone();
+            *second.pointer_mut(index_path).unwrap() = json!(2);
+            *second.pointer_mut(payload_path).unwrap() = json!([66]);
+            for (index, chunk) in [first, second].into_iter().enumerate() {
+                service.process_ingress(
+                    DcMessage::Text(chunk.to_string())
+                        .for_generation(service.session_id.load(Ordering::Relaxed)),
+                );
+                let CallbackEvent::TopicCallback { payload, .. } = events.try_recv().unwrap()
+                else {
+                    panic!("expected original chunk callback");
+                };
+                assert_eq!(payload, chunk);
+                if index == 0 {
+                    assert!(matches!(
+                        response.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+            let merged = response.try_recv().unwrap().unwrap();
+            assert_eq!(merged.pointer(payload_path).unwrap(), &json!([65, 66]));
+            assert!(events.try_recv().is_err());
+        }
     }
 
     // ── subscribe ─────────────────────────────────────────────────────────────
