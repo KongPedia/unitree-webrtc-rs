@@ -8,9 +8,13 @@ from unitree_webrtc_rs import UnitreeWebRTCConnection, WebRTCConnectionMethod
 
 async def main():
     parser = argparse.ArgumentParser(description="Play local audio file to Go2")
-    parser.add_argument("--ip", type=str, default="10.2.80.101", help="Robot IP address")
+    parser.add_argument(
+        "--ip", type=str, default="10.2.80.101", help="Robot IP address"
+    )
     parser.add_argument("--file", type=str, required=True, help="Local audio file path")
-    parser.add_argument("--duration", type=float, default=30.0, help="Playback duration in seconds")
+    parser.add_argument(
+        "--duration", type=float, default=30.0, help="Playback duration in seconds"
+    )
     args = parser.parse_args()
 
     file_path = Path(args.file).expanduser().resolve()

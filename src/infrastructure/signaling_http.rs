@@ -9,23 +9,90 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
-#[derive(Debug, Clone, Default)]
+const SIGNALING_BODY_LIMIT: usize = 1024 * 1024;
+const SIGNALING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
 pub struct HttpSignalingClient {
     aes_128_key: Option<String>,
 }
 
+impl std::fmt::Debug for HttpSignalingClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpSignalingClient")
+            .field(
+                "aes_128_key",
+                &self.aes_128_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 impl HttpSignalingClient {
     pub fn new(aes_128_key: Option<String>) -> Self {
+        crate::infrastructure::ensure_crypto_provider();
         Self {
             aes_128_key: normalize_optional_key(aes_128_key),
         }
     }
 }
 
+impl Default for HttpSignalingClient {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+fn signaling_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(SIGNALING_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| "Signaling HTTP client initialization failed".into())
+}
+
+fn signaling_error(prefix: &str, error: &reqwest::Error) -> String {
+    let reason = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "request"
+    };
+    format!("{prefix}: {reason}")
+}
+
+async fn read_response(mut response: reqwest::Response) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > SIGNALING_BODY_LIMIT as u64)
+    {
+        return Err("Signaling response body exceeds 1 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| signaling_error("Signaling response read failed", &error))?
+    {
+        if chunk.len() > SIGNALING_BODY_LIMIT - bytes.len() {
+            return Err("Signaling response body exceeds 1 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| "Signaling response is not UTF-8".into())
+}
+
 pub async fn send_sdp_local_old(ip: &str, sdp_json: &str) -> Result<String, String> {
     let url = format!("http://{ip}:8081/offer");
-    let client = Client::new();
+    crate::infrastructure::ensure_crypto_provider();
+    let client = signaling_client()?;
 
     let response = client
         .post(url)
@@ -33,7 +100,7 @@ pub async fn send_sdp_local_old(ip: &str, sdp_json: &str) -> Result<String, Stri
         .body(sdp_json.to_string())
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| signaling_error("Signaling request failed", &error))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -42,7 +109,7 @@ pub async fn send_sdp_local_old(ip: &str, sdp_json: &str) -> Result<String, Stri
         ));
     }
 
-    response.text().await.map_err(|error| error.to_string())
+    read_response(response).await
 }
 
 pub async fn send_sdp_local_new(ip: &str, sdp_json: &str) -> Result<String, String> {
@@ -54,14 +121,15 @@ async fn send_sdp_local_new_with_aes_key(
     sdp_json: &str,
     aes_128_key: Option<&str>,
 ) -> Result<String, String> {
-    let client = Client::new();
+    crate::infrastructure::ensure_crypto_provider();
+    let client = signaling_client()?;
     let notify_url = format!("http://{ip}:9991/con_notify");
 
     let response = client
         .post(notify_url)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| signaling_error("Signaling request failed", &error))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -70,14 +138,15 @@ async fn send_sdp_local_new_with_aes_key(
         ));
     }
 
-    let encoded_payload = response.text().await.map_err(|error| error.to_string())?;
+    let encoded_payload = read_response(response).await?;
     let decoded_payload = STANDARD
         .decode(encoded_payload)
-        .map_err(|error| error.to_string())?;
-    let decoded_text = String::from_utf8(decoded_payload).map_err(|error| error.to_string())?;
+        .map_err(|_| "Invalid con_notify base64".to_string())?;
+    let decoded_text =
+        String::from_utf8(decoded_payload).map_err(|_| "Invalid con_notify UTF-8".to_string())?;
 
     let mut decoded_json: Value =
-        serde_json::from_str(&decoded_text).map_err(|error| error.to_string())?;
+        serde_json::from_str(&decoded_text).map_err(|_| "Invalid con_notify JSON".to_string())?;
     decoded_json["data1"] = Value::String(decode_con_notify_data1(&decoded_json, aes_128_key)?);
 
     let data1 = decoded_json
@@ -85,11 +154,7 @@ async fn send_sdp_local_new_with_aes_key(
         .and_then(Value::as_str)
         .ok_or_else(|| "con_notify data1 field missing".to_string())?;
 
-    if data1.len() < 20 {
-        return Err("con_notify data1 is too short".to_string());
-    }
-
-    let public_key_pem = &data1[10..data1.len() - 10];
+    let public_key_pem = con_notify_public_key(data1)?;
     let path_ending = calc_local_path_ending(data1);
 
     let aes_key = generate_aes_key();
@@ -107,7 +172,7 @@ async fn send_sdp_local_new_with_aes_key(
         .body(body.to_string())
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| signaling_error("Signaling request failed", &error))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -116,7 +181,7 @@ async fn send_sdp_local_new_with_aes_key(
         ));
     }
 
-    let encrypted_answer = response.text().await.map_err(|error| error.to_string())?;
+    let encrypted_answer = read_response(response).await?;
     aes_ecb_decrypt(&encrypted_answer, &aes_key)
 }
 
@@ -173,7 +238,7 @@ fn decode_con_notify_data1(
     let data2 = match decoded_json.get("data2") {
         Some(value) => value
             .as_i64()
-            .ok_or_else(|| format!("con_notify data2 must be an integer, got {value}"))?,
+            .ok_or_else(|| "con_notify data2 must be an integer".to_string())?,
         None => 0,
     };
 
@@ -192,6 +257,15 @@ fn decode_con_notify_data1(
         }
         mode => Err(format!("unsupported con_notify data2 auth mode: {mode}")),
     }
+}
+
+fn con_notify_public_key(data1: &str) -> Result<&str, String> {
+    if data1.len() < 20 {
+        return Err("con_notify data1 is too short".to_string());
+    }
+    data1
+        .get(10..data1.len() - 10)
+        .ok_or_else(|| "con_notify data1 wrapper has invalid UTF-8 boundaries".to_string())
 }
 
 fn calc_local_path_ending(data1: &str) -> String {
@@ -222,12 +296,161 @@ fn calc_local_path_ending(data1: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{calc_local_path_ending, decode_con_notify_data1};
+    use super::{
+        calc_local_path_ending, con_notify_public_key, decode_con_notify_data1, HttpSignalingClient,
+    };
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use serde_json::json;
+
+    async fn response_fixture(chunked: bool, size: usize) -> reqwest::Response {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            let mut reply = if chunked {
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{size:x}\r\n").into_bytes()
+            } else {
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n")
+                    .into_bytes()
+            };
+            reply.resize(reply.len() + size, b'x');
+            if chunked {
+                reply.extend_from_slice(b"\r\n0\r\n\r\n");
+            }
+            let _ = socket.write_all(&reply);
+        });
+        crate::infrastructure::ensure_crypto_provider();
+        super::signaling_client()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn signaling_errors_keep_safe_classes_without_url_secrets() {
+        crate::infrastructure::ensure_crypto_provider();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = super::signaling_client().unwrap();
+        let error = client
+            .get(format!(
+                "http://sentinel-user:sentinel-secret@{address}/private-path"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            super::signaling_error("Signaling request failed", &error),
+            "Signaling request failed: connect"
+        );
+        let error = client
+            .get("http://sentinel-user:sentinel-secret@[invalid/private-path")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            super::signaling_error("Signaling request failed", &error),
+            "Signaling request failed: request"
+        );
+    }
+
+    #[tokio::test]
+    async fn signaling_request_deadline_covers_stalled_response_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(12));
+        });
+        crate::infrastructure::ensure_crypto_provider();
+        let response = super::signaling_client()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(11),
+            super::read_response(response),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "Signaling response read failed: timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn signaling_response_bounds_length_and_chunked_bodies() {
+        for chunked in [false, true] {
+            let response = response_fixture(chunked, 1024 * 1024 + 1).await;
+            assert!(
+                super::read_response(response).await.is_err(),
+                "oversized body accepted (chunked={chunked})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signaling_response_accepts_body_at_limit() {
+        for chunked in [false, true] {
+            let response = response_fixture(chunked, 1024 * 1024).await;
+            assert_eq!(
+                super::read_response(response).await.unwrap().len(),
+                1024 * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn signaling_debug_redacts_device_key() {
+        let client = HttpSignalingClient {
+            aes_128_key: Some("sentinel-private-key".into()),
+        };
+        for debug in [
+            format!("{client:?}"),
+            format!("{client:#?}"),
+            format!("{:?}", client.clone()),
+        ] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains("sentinel-private-key"));
+        }
+        let absent = HttpSignalingClient { aes_128_key: None };
+        assert!(format!("{absent:?}").contains("None"));
+    }
+
+    #[test]
+    fn malformed_auth_mode_does_not_echo_peer_payload() {
+        for mode in [
+            json!("sentinel-private-key"),
+            json!({"secret": "sentinel-private-key"}),
+            json!(["sentinel-private-key"]),
+            json!(null),
+            json!(0.5),
+        ] {
+            let input = json!({"data1": "sentinel-private-key", "data2": mode});
+            assert_eq!(
+                decode_con_notify_data1(&input, None).unwrap_err(),
+                "con_notify data2 must be an integer"
+            );
+        }
+    }
 
     #[test]
     fn path_ending_uses_second_char_index() {
@@ -238,6 +461,17 @@ mod tests {
     #[test]
     fn short_string_returns_empty() {
         assert!(calc_local_path_ending("short").is_empty());
+    }
+
+    #[test]
+    fn public_key_wrapping_rejects_invalid_boundaries_without_panicking() {
+        assert_eq!(
+            con_notify_public_key("0123456789PEM0123456789").unwrap(),
+            "PEM"
+        );
+        for input in ["short", "aaaaaaaaa가aaaaaaaaaaaa", "aaaaaaaaaa가aaaaaaaaa"] {
+            assert!(con_notify_public_key(input).is_err());
+        }
     }
 
     #[test]

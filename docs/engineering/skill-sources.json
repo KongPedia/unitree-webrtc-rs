@@ -1,0 +1,53 @@
+{
+  "repository": "https://github.com/wshobson/agents",
+  "revision": "46891e7e60da0e52baf1050b7b6391b64e84c6d9",
+  "installed_on": "2026-10-09",
+  "route": "project-local source skills plus unmodified prompt references; not native agent registration or plugin installation",
+  "files": [
+    {
+      "local": ".agents/skills/architecture-patterns/SKILL.md",
+      "source": "plugins/backend-development/skills/architecture-patterns/SKILL.md",
+      "sha256": "350caf22b856b7d2908a10a69a8cc13e743c757ba9838716051b4e29fc1d7595"
+    },
+    {
+      "local": ".agents/skills/architecture-patterns/references/advanced-patterns.md",
+      "source": "plugins/backend-development/skills/architecture-patterns/references/advanced-patterns.md",
+      "sha256": "e1cb31c83b532e579991de277836a1ea5e3d88b2ca30fc8ac16f6047ceca439e"
+    },
+    {
+      "local": ".agents/skills/architecture-patterns/references/details.md",
+      "source": "plugins/backend-development/skills/architecture-patterns/references/details.md",
+      "sha256": "a53411600b253b343247db9d86140f3136ee7bd26a67aa8411962bcc1f5ff981"
+    },
+    {
+      "local": ".agents/skills/rust-async-patterns/SKILL.md",
+      "source": "plugins/systems-programming/skills/rust-async-patterns/SKILL.md",
+      "sha256": "8e9a951c21bb1ee671dd2e7391b193e8e3d362b95ef29c470915837d73bf87df"
+    },
+    {
+      "local": ".agents/skills/rust-async-patterns/references/details.md",
+      "source": "plugins/systems-programming/skills/rust-async-patterns/references/details.md",
+      "sha256": "cd8a987c59cf704b7a2145e0dea6891b10194e7304b894bd14a5692d9fdfa76d"
+    },
+    {
+      "local": ".agents/skills/code-review-excellence/SKILL.md",
+      "source": "plugins/developer-essentials/skills/code-review-excellence/SKILL.md",
+      "sha256": "014fff1c8db75807106484d5b16451607f0dde266ae50182a2753d68ad3449ed"
+    },
+    {
+      "local": "docs/engineering/upstream-prompts/rust-pro.md",
+      "source": "plugins/systems-programming/agents/rust-pro.md",
+      "sha256": "a327490f71278df0276b4e7dcc3991d45ace4a09cc068cf1632f5ec6fec11b52"
+    },
+    {
+      "local": "docs/engineering/upstream-prompts/refactor-clean.md",
+      "source": "plugins/code-refactoring/commands/refactor-clean.md",
+      "sha256": "5a2b4965abd44895f5d19da185ab6b39db1db3d65ad532f9fd655b4dcd535937"
+    },
+    {
+      "local": "docs/engineering/upstream-license.txt",
+      "source": "LICENSE",
+      "sha256": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746"
+    }
+  ]
+}

@@ -61,6 +61,24 @@ impl RequestIdentity {
 pub enum DcMessage {
     Text(String),
     Binary(Bytes),
+    /// Local terminal adapter fault; never encoded on the robot wire.
+    TransportFault(String),
+}
+
+/// Internal transport metadata; never serialized onto the robot wire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IngressMessage {
+    pub generation: u64,
+    pub payload: DcMessage,
+}
+
+impl DcMessage {
+    pub fn for_generation(self, generation: u64) -> IngressMessage {
+        IngressMessage {
+            generation,
+            payload: self,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,36 +1,67 @@
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyDict;
-use std::sync::Once;
-use tracing::info;
+#[cfg(feature = "python")]
+use tracing::debug;
+#[cfg(feature = "python")]
 use tracing_subscriber::EnvFilter;
 
 pub mod audio;
 pub mod connection;
 pub mod datachannel;
+mod diagnostics;
 pub mod infrastructure;
+#[cfg(feature = "python")]
 pub mod interface;
 pub mod protocol;
+#[cfg(test)]
+mod test_support;
 pub mod video;
 
-static TRACING_INIT: Once = Once::new();
-
-fn init_tracing() {
-    TRACING_INIT.call_once(|| {
-        let filter = std::env::var("UNITREE_WEBRTC_RS_LOG").unwrap_or_else(|_| {
-            "unitree_webrtc_rs=info,webrtc=error,webrtc_ice=error,webrtc_mdns=error,dtls=error,warn"
-                .to_string()
-        });
-
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(filter))
-            .with_target(false)
-            .with_thread_names(false)
-            .with_thread_ids(false)
-            .compact()
-            .try_init();
-    });
+#[cfg(feature = "python")]
+fn init_tracing() -> PyResult<()> {
+    // A host's earlier global or scoped subscriber owns logging policy, not this SDK.
+    if tracing::dispatcher::has_been_set() {
+        return Ok(());
+    }
+    match std::env::var("UNITREE_WEBRTC_RS_LOG_INIT") {
+        Ok(value) if value == "0" => return Ok(()),
+        Ok(value) if value == "1" => {}
+        Err(std::env::VarError::NotPresent) => {}
+        _ => {
+            return Err(PyValueError::new_err(
+                "UNITREE_WEBRTC_RS_LOG_INIT must be 0 or 1",
+            ));
+        }
+    }
+    let filter = match std::env::var("UNITREE_WEBRTC_RS_LOG") {
+        Ok(value) => EnvFilter::try_new(value)
+            .map_err(|_| PyValueError::new_err("invalid UNITREE_WEBRTC_RS_LOG filter"))?,
+        Err(std::env::VarError::NotPresent) => EnvFilter::new("warn"),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(PyValueError::new_err(
+                "UNITREE_WEBRTC_RS_LOG must be Unicode",
+            ));
+        }
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_names(false)
+        .with_thread_ids(false)
+        .compact()
+        .finish();
+    // The only possible failure is a competing host installation; preserve its policy.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    Ok(())
 }
 
+#[cfg(feature = "python")]
 fn register_constants(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // DATA_CHANNEL_TYPE: Dict[str, str]
     let dc_type = PyDict::new(py);
@@ -70,11 +101,14 @@ fn register_constants(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn unitree_webrtc_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    init_tracing();
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    info!("unitree_webrtc_rs module initialized");
+    init_tracing()?;
+    debug!(
+        event = "module_initialized",
+        "unitree_webrtc_rs module initialized"
+    );
 
     m.add_class::<interface::bridges::PyUnitreeWebRTCConnection>()?;
     m.add_class::<interface::bridges::PyWebRTCConnectionMethod>()?;
@@ -93,4 +127,87 @@ fn unitree_webrtc_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     modules.set_item("unitree_webrtc_rs.webrtc_driver", &driver_module)?;
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "python"))]
+mod logging_tests {
+    use super::*;
+
+    #[test]
+    fn native_subscriber_policy_is_process_isolated() {
+        const CASE: &str = "UNITREE_LOGGING_FIXTURE";
+        let Ok(case) = std::env::var(CASE) else {
+            for case in ["default", "info", "debug", "host-invalid", "host-after"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "logging_tests::native_subscriber_policy_is_process_isolated",
+                        "--nocapture",
+                    ])
+                    .env(CASE, case)
+                    .env_remove("UNITREE_WEBRTC_RS_LOG")
+                    .env_remove("UNITREE_WEBRTC_RS_LOG_INIT")
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(output.status.success(), "{case}: {stderr}");
+                if case.starts_with("host-") {
+                    assert!(stderr.contains("HOST "), "{stderr}");
+                }
+                assert!(stderr.contains("WARN"), "{case}: {stderr}");
+                assert_eq!(stderr.contains("INFO"), case != "default");
+                assert_eq!(
+                    stderr.contains("DEBUG"),
+                    case == "debug" || case.starts_with("host-")
+                );
+                assert!(stderr.contains("unitree_webrtc_rs"), "{stderr}");
+            }
+            return;
+        };
+        let install_host = || {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_target(true)
+                    .with_timer(HostPrefix)
+                    .finish(),
+            )
+            .unwrap();
+        };
+        if case == "host-invalid" {
+            install_host();
+            std::env::set_var("UNITREE_WEBRTC_RS_LOG_INIT", "secret-invalid-init");
+            std::env::set_var("UNITREE_WEBRTC_RS_LOG", "sdk=secret-invalid-level");
+        } else if case == "host-after" {
+            std::env::set_var("UNITREE_WEBRTC_RS_LOG_INIT", "0");
+            std::env::set_var("UNITREE_WEBRTC_RS_LOG", "sdk=secret-invalid-level");
+        } else if case != "default" {
+            std::env::set_var("UNITREE_WEBRTC_RS_LOG", format!("unitree_webrtc_rs={case}"));
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "unitree_webrtc_rs").unwrap();
+            unitree_webrtc_rs(py, &module).unwrap();
+        });
+        if case == "host-after" {
+            assert!(!tracing::dispatcher::has_been_set());
+            install_host();
+        }
+        tracing::warn!(event = "logging_fixture_warn");
+        tracing::info!(event = "logging_fixture_info");
+        tracing::debug!(event = "logging_fixture_debug");
+    }
+
+    struct HostPrefix;
+
+    impl tracing_subscriber::fmt::time::FormatTime for HostPrefix {
+        fn format_time(
+            &self,
+            writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+        ) -> std::fmt::Result {
+            write!(writer, "HOST")
+        }
+    }
 }

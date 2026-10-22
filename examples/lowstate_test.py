@@ -1,34 +1,56 @@
-import asyncio
-from unitree_webrtc_rs import UnitreeWebRTCConnection, WebRTCConnectionMethod
+"""Validate LOW_STATE subscription without physical commands."""
 
-RTC_TOPIC = {
-    "LOW_STATE": "rt/lf/lowstate",
-}
+import asyncio
+import time
+
+from unitree_webrtc_rs import RTC_TOPIC
+
+from example_support import argument_parser, connection, run
+
+
+async def collect_state(conn, topic, duration, required_fields):
+    count = 0
+    latest = None
+    malformed = False
+    received_at = None
+
+    def callback(message):
+        nonlocal count, latest, malformed, received_at
+        data = message.get("data") if isinstance(message, dict) else None
+        if not isinstance(data, dict) or not all(
+            key in data for key in required_fields
+        ):
+            malformed = True
+            return
+        count += 1
+        latest = data
+        received_at = time.monotonic()
+
+    conn.datachannel.pub_sub.subscribe(topic, callback)
+    try:
+        await asyncio.sleep(duration)
+        if malformed or count == 0 or time.monotonic() - received_at > 1.0:
+            raise RuntimeError("No valid state stream received")
+        print(f"State {topic}: {count} frames, fields={sorted(latest)}")
+        return latest
+    finally:
+        conn.datachannel.pub_sub.unsubscribe(topic)
+
+
+def parse_args():
+    return argument_parser("Validate LOW_STATE").parse_args()
+
 
 async def main():
-    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="10.2.80.101")
-    await conn.connect()
-    print("✅ Connected")
-    
-    frame_count = 0
-    
-    def lowstate_callback(message):
-        nonlocal frame_count
-        frame_count += 1
-        if frame_count == 1:
-            print(f"\n[Rust] First LowState frame:")
-            print(f"  Type: {type(message)}")
-            print(f"  Keys: {list(message.keys())}")
-            data = message.get('data', {})
-            print(f"  Data type: {type(data)}")
-            print(f"  Data keys: {list(data.keys())[:10] if isinstance(data, dict) else 'not dict'}")
-            print(f"  IMU state exists: {'imu_state' in data if isinstance(data, dict) else False}")
-    
-    conn.datachannel.pub_sub.subscribe(RTC_TOPIC['LOW_STATE'], lowstate_callback)
-    print("✅ Subscribed to LOW_STATE")
-    
-    await asyncio.sleep(3)
-    print(f"\n✅ Received {frame_count} LowState frames")
+    args = parse_args()
+    async with connection(args) as conn:
+        await collect_state(
+            conn,
+            RTC_TOPIC["LOW_STATE"],
+            args.duration,
+            ("imu_state", "motor_state", "bms_state"),
+        )
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run(main)

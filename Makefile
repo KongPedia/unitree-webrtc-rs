@@ -1,12 +1,21 @@
-.PHONY: help doctor init build test check bootstrap deploy
+.PHONY: help doctor init build test test-rust test-core test-python check check-rust-lint check-guidance acceptance wheel-smoke bootstrap deploy
+
+# Cargo/PyO3 build scripts share outputs: never race embedded tests with extension builds.
+.NOTPARALLEL:
+UV = uv run --locked --no-sync
+export PYO3_PYTHON = $(shell $(UV) python -c 'import sys; print(sys.executable)')
 
 help:
 	@echo "Targets:"
 	@echo "  make doctor     # Check local toolchain/system deps"
 	@echo "  make init       # Sync Python deps and build extension"
 	@echo "  make build      # Build extension in uv environment"
-	@echo "  make test       # Run Python tests (if tests/ exists)"
-	@echo "  make check      # Run Rust format/lint/type checks"
+	@echo "  make test       # Run Rust and Python tests"
+	@echo "  make test-core  # Check/test Rust without Python dependencies"
+	@echo "  make check      # Run guidance and Rust format/lint/type checks"
+	@echo "  make acceptance # Offline checks/core/Rust/fresh-native tests"
+	@echo "  make check-guidance # Verify pinned guidance metadata/hashes/links"
+	@echo "  make wheel-smoke WHEEL=path.whl # Isolated fresh-wheel import"
 	@echo "  make bootstrap  # Full setup + checks + tests"
 	@echo "  make deploy     # Sync versions and build for release"
 
@@ -22,43 +31,53 @@ doctor:
 	@echo "doctor: OK"
 
 init: doctor
-	uv sync --dev
-	uv run pre-commit install
-	uv run maturin develop
+	uv sync --locked --dev --no-install-project
+	uv run --locked --no-sync pre-commit install
+	uv run --locked --no-sync maturin develop --locked
 
 build:
-	uv run maturin develop
+	uv run --locked --no-sync maturin develop --locked
 
 test: test-rust test-python
 
 test-rust:
-	RUSTFLAGS="-C link-args=-Wl,-undefined,dynamic_lookup" cargo test
+	PYTHONHOME="$$(uv run --locked --no-sync python -c 'import sys; print(sys.base_prefix)')" PYTHONPATH="$$(uv run --locked --no-sync python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')$${PYTHONPATH:+:$$PYTHONPATH}" uv run --locked --no-sync cargo test --locked
 
-test-python:
-	@if [ -d tests ]; then uv run pytest -q; else echo "No tests directory; skipping pytest."; fi
+test-core:
+	@tree="$$(cargo tree --locked --no-default-features --prefix none --format '{p}')" || exit $$?; \
+	if printf '%s\n' "$$tree" | grep -E '^(pyo3(-[^ ]*)?|numpy) v'; then \
+		echo "Python dependency found in core graph"; exit 1; \
+	fi
+	cargo check --locked --no-default-features --all-targets
+	cargo clippy --locked --no-default-features --all-targets -- -D warnings
+	cargo test --locked --no-default-features
 
-check:
-	cargo fmt -- --check
-	cargo clippy --all-targets --all-features -- -D warnings
-	cargo check --tests
+test-python: build
+	@if [ -d tests ]; then uv run --locked --no-sync pytest -q; else echo "No tests directory; skipping pytest."; fi
 
-bootstrap: init check test
+check: check-guidance
+	$(UV) cargo fmt -- --check
+	$(MAKE) check-rust-lint
+	$(UV) cargo check --locked --tests
+
+check-rust-lint:
+	$(UV) cargo clippy --locked --all-targets --all-features -- -D warnings
+
+check-guidance:
+	$(UV) python scripts/check-guidance.py
+
+acceptance: check test-core test-rust test-python
+
+wheel-smoke:
+	$(UV) python scripts/smoke-wheel.py "$(WHEEL)"
+
+bootstrap: init acceptance
 	@echo "bootstrap: complete"
 
 deploy:
-	@if [ -n "$(VERSION)" ]; then \
-		echo "🔄 Updating version to $(VERSION)..."; \
-		./scripts/sync-version.sh $(VERSION); \
-	fi
-	@echo "🚀 Deploy: Syncing versions and building for release..."
-	@echo "📋 Current versions:"
-	@echo "   Cargo.toml:    $$(grep '^version = ' Cargo.toml | cut -d'"' -f2)"
-	@echo "   pyproject.toml: $$(grep '^version = ' pyproject.toml | cut -d'"' -f2)"
-	@echo ""
-	@echo "✅ Versions are synchronized"
-	@echo ""
+	./scripts/sync-version.sh "$(or $(VERSION),$(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1))"
 	@echo " Building Python wheel for distribution..."
-	uv run maturin build --release
+	uv run --locked --no-sync maturin build --release --locked
 	@echo ""
 	@echo "🎉 Deploy complete!"
 	@echo "   Build artifacts:"

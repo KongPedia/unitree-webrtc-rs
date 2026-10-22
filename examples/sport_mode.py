@@ -1,160 +1,150 @@
-import argparse
+"""Read-only by default; explicit consent enables guarded posture actions."""
+
 import asyncio
 import json
-import logging
-import os
-import sys
+import math
 
-from unitree_webrtc_rs.webrtc_driver import (
-    UnitreeWebRTCConnection,
-    WebRTCConnectionMethod,
+from unitree_webrtc_rs import RTC_TOPIC, SPORT_CMD
+
+from example_support import (
+    UnsupportedPostureModeError,
+    argument_parser,
+    connection,
+    response_data,
+    run,
 )
+from lowstate_test import collect_state
 
-logging.basicConfig(level=logging.FATAL)
-
-RTC_TOPIC = {
-    "SPORT_MOD": "rt/api/sport/request",
-    "MOTION_SWITCHER": "rt/api/motion_switcher/request",
-}
-
-SPORT_CMD = {
-    "StandUp": 1004,
-    "RecoveryStand": 1006,
-    "Hello": 1016,
-    "FrontFlip": 1030,
-    "StandDown": 1005,
-    "GetState": 1034,
-}
+# Go2 motion-switcher read API; this is not the sport Damp API with the same ID.
+MOTION_SWITCHER_GET_MODE = 1001
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="unitree_webrtc_rs sportmode example")
-    parser.add_argument("--ip", default=os.getenv("ROBOT_IP", "10.2.80.114"))
-    parser.add_argument("--duration", type=float, default=3600.0)
-    parser.add_argument(
-        "--full-sequence",
-        action="store_true",
-        help="Run full motion sequence (includes aggressive motion commands).",
+async def query_state(conn):
+    reply = await conn.datachannel.pub_sub.publish_request_new(
+        RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["GetState"]}, timeout=10
     )
-    return parser.parse_args()
+    response_data(reply)
+    print("GetState status code: 0")
 
 
-async def main() -> None:
+def finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def body_height(state):
+    height = state.get("body_height")
+    if not finite_number(height) or not 0 <= height <= 1:
+        raise ValueError("Invalid body height; refusing motion")
+    return height
+
+
+def require_live_session(conn):
+    age = conn.datachannel.last_heartbeat_age_s
+    if (
+        not conn.isConnected
+        or not conn.datachannel.heartbeat_running
+        or type(age) is not int
+        or age > 3
+    ):
+        raise ValueError(
+            "Fresh heartbeat and connected session required; refusing motion"
+        )
+
+
+async def observe_posture(conn, duration):
+    low, sport = await asyncio.gather(
+        collect_state(conn, RTC_TOPIC["LOW_STATE"], duration, ("imu_state",)),
+        collect_state(
+            conn, RTC_TOPIC["LF_SPORT_MOD_STATE"], duration, ("body_height", "mode")
+        ),
+    )
+    rpy = low["imu_state"].get("rpy") if isinstance(low["imu_state"], dict) else None
+    if (
+        not isinstance(rpy, (list, tuple))
+        or len(rpy) != 3
+        or not all(finite_number(value) for value in rpy)
+    ):
+        raise ValueError("Fresh finite orientation required; refusing motion")
+    if abs(rpy[0]) > 0.5 or abs(rpy[1]) > 0.5:
+        raise ValueError("Unsafe orientation; refusing motion")
+    require_live_session(conn)
+    return body_height(sport), sport["mode"]
+
+
+async def posture_sequence(conn, duration, posture="cycle"):
+    reply = await conn.datachannel.pub_sub.publish_request_new(
+        RTC_TOPIC["MOTION_SWITCHER"], {"api_id": MOTION_SWITCHER_GET_MODE}, timeout=10
+    )
+    mode = response_data(reply)
+    if isinstance(mode, str):
+        mode = json.loads(mode)
+    # Only StandUp/StandDown are verified for both modes; do not generalize other APIs.
+    if not isinstance(mode, dict) or mode.get("name") not in ("normal", "mcf"):
+        raise UnsupportedPostureModeError(
+            "Normal or MCF motion mode required; this example does not switch modes"
+        )
+    baseline, _ = await observe_posture(conn, duration)
+    if posture != "stand-down" and baseline > 0.2:
+        raise ValueError("Start in a lowered posture for this validation sequence")
+    if posture == "stand-down" and baseline <= 0.2:
+        raise ValueError("Start standing for single StandDown validation")
+    commands = {
+        "cycle": ("StandUp", "StandDown"),
+        "stand-up": ("StandUp",),
+        "stand-down": ("StandDown",),
+    }[posture]
+    if posture == "stand-up":
+        print("Explicit StandUp: robot will remain standing; run StandDown separately")
+    previous_height = baseline
+    confirmed = []
+    for name in commands:
+        require_live_session(conn)
+        reply = await conn.datachannel.pub_sub.publish_request_new(
+            RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD[name]}, timeout=10
+        )
+        response_data(reply)
+        height, mode = await observe_posture(conn, duration)
+        delta = (
+            height - previous_height if name == "StandUp" else previous_height - height
+        )
+        confirmed.append(delta >= 0.1)
+        previous_height = height
+        print(
+            f"{name}: status=0, body_height={height}, mode={mode}, observed_delta={delta:.3f}m"
+        )
+        # An ACK without an upward delta is not proof, but safe gates still permit the requested lowering.
+    if not all(confirmed) or (posture != "stand-up" and previous_height > 0.2):
+        raise RuntimeError("Posture telemetry did not confirm the requested movement")
+
+
+def parse_args(argv=None):
+    parser = argument_parser("Query state; optionally StandUp/StandDown only")
+    parser.add_argument(
+        "--allow-motion",
+        action="store_true",
+        help="Explicitly permit the selected posture action",
+    )
+    parser.add_argument(
+        "--posture",
+        choices=("cycle", "stand-up", "stand-down"),
+        default="cycle",
+        help="Cycle finishes lowered; stand-up intentionally leaves the robot standing",
+    )
+    args = parser.parse_args(argv)
+    if args.posture != "cycle" and not args.allow_motion:
+        parser.error("--posture requires --allow-motion")
+    return args
+
+
+async def main():
     args = parse_args()
-
-    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=args.ip)
-    # conn = UnitreeWebRTCConnection(
-    #     WebRTCConnectionMethod.LocalSTA, serialNumber="B42D2000XXXXXXXX"
-    # )
-    # conn = UnitreeWebRTCConnection(
-    #     WebRTCConnectionMethod.Remote,
-    #     serialNumber="B42D2000XXXXXXXX",
-    #     username="email@gmail.com",
-    #     password="pass",
-    # )
-    # conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalAP)
-
-    try:
-        await conn.connect()
-
-        print("Checking current motion mode...")
-        response = await conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["MOTION_SWITCHER"],
-            {"api_id": 1001},
-        )
-
-        current_motion_switcher_mode = "unknown"
-        if response["data"]["header"]["status"]["code"] == 0:
-            payload = response["data"]["data"]
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            current_motion_switcher_mode = payload.get("name", "unknown")
-            print(f"Current motion mode: {current_motion_switcher_mode}")
-
-        if current_motion_switcher_mode != "normal":
-            print(
-                f"Switching motion mode from {current_motion_switcher_mode} to 'normal'..."
-            )
-            await conn.datachannel.pub_sub.publish_request_new(
-                RTC_TOPIC["MOTION_SWITCHER"],
-                {
-                    "api_id": 1002,
-                    "parameter": {"name": "normal"},
-                },
-            )
-            await asyncio.sleep(5)
-
-        if not args.full_sequence:
-            print("Running safe command path check (GetState)...")
-            safe_response = await conn.datachannel.pub_sub.publish_request_new(
-                RTC_TOPIC["SPORT_MOD"],
-                {"api_id": SPORT_CMD["GetState"]},
-            )
-            if isinstance(safe_response, dict):
-                code = (
-                    safe_response.get("data", {})
-                    .get("header", {})
-                    .get("status", {})
-                    .get("code")
-                )
-                print(f"GetState status code: {code}")
-
-            print(f"Keeping session alive for {args.duration:.1f}s")
+    async with connection(args) as conn:
+        await query_state(conn)
+        if args.allow_motion:
+            await posture_sequence(conn, args.duration, args.posture)
+        else:
             await asyncio.sleep(args.duration)
-            return
-
-        print("Performing 'StandUp' movement...")
-        await conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {"api_id": SPORT_CMD["StandUp"]},
-        )
-
-        print("Performing 'RecoveryStand' movement...")
-        await conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {"api_id": SPORT_CMD["RecoveryStand"]},
-        )
-        await asyncio.sleep(1)
-
-        print("Performing 'Hello' movement...")
-        await conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {"api_id": SPORT_CMD["Hello"]},
-        )
-
-        print("Switching to FrontFlip mode...")
-        await conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {
-                "api_id": SPORT_CMD["FrontFlip"],
-                "parameter": {"data": True},
-            },
-        )
-
-        print("Switching to StandDown mode...")
-        await conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {
-                "api_id": SPORT_CMD["StandDown"],
-                "parameter": {"data": True},
-            },
-        )
-
-        print(f"Keeping session alive for {args.duration:.1f}s")
-        await asyncio.sleep(args.duration)
-
-    except ValueError as error:
-        logging.error(f"An error occurred: {error}")
-    finally:
-        try:
-            await conn.disconnect()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by user")
-        sys.exit(0)
+    run(main)

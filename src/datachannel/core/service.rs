@@ -1,24 +1,94 @@
+use super::chunks::ChunkAssembler;
 use crate::datachannel::lidar::{LidarDecodeRequest, LidarMetadata, LidarWorkerPool};
+use crate::diagnostics::RepeatLog;
 use crate::infrastructure::security::encrypt_key;
 use crate::protocol::constants::data_channel_type;
-use crate::protocol::models::{CallbackEvent, DcMessage, RequestIdentity};
+#[cfg(test)]
+use crate::protocol::events::event_channel;
+#[cfg(test)]
+use crate::protocol::events::EventReceiver;
+use crate::protocol::events::EventSender;
+use crate::protocol::models::{CallbackEvent, DcMessage, IngressMessage, RequestIdentity};
 use crate::protocol::ports::{DataChannelPort, PortResult};
 use bytes::Bytes;
 use chrono::Local;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+// Queue acceptance does not bound requests already sent while awaiting responses.
+const MAX_PENDING_REQUESTS: usize = 128;
+
+struct CoreDiagnostics {
+    parse: RepeatLog,
+    chunk: RepeatLog,
+    callback: RepeatLog,
+    binary: RepeatLog,
+    lidar_submit: RepeatLog,
+    lidar_invalid: RepeatLog,
+    control_send: RepeatLog,
+}
+
+impl CoreDiagnostics {
+    fn new() -> Self {
+        Self {
+            parse: RepeatLog::new("datachannel_json_parse_failed", "malformed_json"),
+            chunk: RepeatLog::new("invalid_chunk_response", "invalid_chunk"),
+            callback: RepeatLog::new("python_callback_drop", "queue_budget_or_stale"),
+            binary: RepeatLog::new("binary_message_ignored", "malformed_frame"),
+            lidar_submit: RepeatLog::new("lidar_worker_submit_failed", "queue_full_or_closed"),
+            lidar_invalid: RepeatLog::new("invalid_lidar_response", "invalid_metadata_or_size"),
+            control_send: RepeatLog::new("datachannel_control_send_failed", "enqueue_failed"),
+        }
+    }
+
+    fn reset(&self) {
+        for log in [
+            &self.parse,
+            &self.chunk,
+            &self.callback,
+            &self.binary,
+            &self.lidar_submit,
+            &self.lidar_invalid,
+            &self.control_send,
+        ] {
+            log.reset();
+        }
+    }
+}
 
 struct PendingCallback {
+    token: Arc<()>,
     sender: oneshot::Sender<PortResult<Value>>,
     expectation: ResponseExpectation,
     session_id: u64,
+}
+
+struct PendingRequestGuard<'a> {
+    pending: &'a Mutex<HashMap<String, PendingCallback>>,
+    chunks: &'a Mutex<ChunkAssembler>,
+    key: String,
+    token: Arc<()>,
+}
+
+impl Drop for PendingRequestGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending
+            .get(&self.key)
+            .is_some_and(|callback| Arc::ptr_eq(&callback.token, &self.token))
+        {
+            pending.remove(&self.key);
+            self.chunks.lock().unwrap().remove(&self.key);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,9 +211,13 @@ where
     transport: Arc<T>,
     pending_callbacks: Arc<Mutex<HashMap<String, PendingCallback>>>,
     subscriptions: Arc<Mutex<HashSet<String>>>,
-    chunk_data_storage: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
+    chunk_data_storage: Arc<Mutex<ChunkAssembler>>,
+    // Public clones retain lifetime; worker clones only observe the weak token.
+    external_owner: Option<Arc<()>>,
+    owner_lifetime: Weak<()>,
+    lifecycle_lock: Arc<Mutex<()>>,
     validation_key: Arc<Mutex<String>>,
-    callback_events_tx: Sender<CallbackEvent>,
+    callback_events_tx: EventSender,
     data_channel_opened: Arc<AtomicBool>,
     heartbeat_last_response: Arc<AtomicU64>,
     heartbeat_running: Arc<AtomicBool>,
@@ -155,6 +229,7 @@ where
     is_remote_connection: bool,
     session_id: Arc<AtomicU64>,
     request_sequence: Arc<AtomicU64>,
+    diagnostics: Arc<CoreDiagnostics>,
 }
 
 impl<T> Clone for DataChannelService<T>
@@ -167,6 +242,9 @@ where
             pending_callbacks: Arc::clone(&self.pending_callbacks),
             subscriptions: Arc::clone(&self.subscriptions),
             chunk_data_storage: Arc::clone(&self.chunk_data_storage),
+            external_owner: self.external_owner.clone(),
+            owner_lifetime: self.owner_lifetime.clone(),
+            lifecycle_lock: Arc::clone(&self.lifecycle_lock),
             validation_key: Arc::clone(&self.validation_key),
             callback_events_tx: self.callback_events_tx.clone(),
             data_channel_opened: Arc::clone(&self.data_channel_opened),
@@ -180,6 +258,7 @@ where
             is_remote_connection: self.is_remote_connection,
             session_id: Arc::clone(&self.session_id),
             request_sequence: Arc::clone(&self.request_sequence),
+            diagnostics: Arc::clone(&self.diagnostics),
         }
     }
 }
@@ -190,8 +269,8 @@ where
 {
     pub fn new(
         transport: Arc<T>,
-        incoming_rx: Receiver<DcMessage>,
-        callback_events_tx: Sender<CallbackEvent>,
+        incoming_rx: Receiver<IngressMessage>,
+        callback_events_tx: EventSender,
         lidar_worker_pool: Arc<LidarWorkerPool>,
         is_remote_connection: bool,
     ) -> Self {
@@ -199,11 +278,17 @@ where
         throttle_limits.insert("rt/utlidar/voxel_map_compressed".to_string(), 1.0 / 15.0);
         throttle_limits.insert(dc_types().vid.to_string(), 1.0 / 15.0);
 
+        let external_owner = Arc::new(());
+        let session_id = callback_events_tx.generation_state();
+        session_id.store(Self::new_session_id(), Ordering::SeqCst);
         let service = Self {
             transport,
             pending_callbacks: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
-            chunk_data_storage: Arc::new(Mutex::new(HashMap::new())),
+            chunk_data_storage: Arc::new(Mutex::new(ChunkAssembler::default())),
+            external_owner: Some(external_owner.clone()),
+            owner_lifetime: Arc::downgrade(&external_owner),
+            lifecycle_lock: Arc::new(Mutex::new(())),
             validation_key: Arc::new(Mutex::new(String::new())),
             callback_events_tx,
             data_channel_opened: Arc::new(AtomicBool::new(false)),
@@ -215,15 +300,24 @@ where
             decoder_type: Arc::new(Mutex::new("native".to_string())),
             lidar_worker_pool,
             is_remote_connection,
-            session_id: Arc::new(AtomicU64::new(Self::new_session_id())),
+            session_id,
             request_sequence: Arc::new(AtomicU64::new(Self::initial_request_sequence())),
+            diagnostics: Arc::new(CoreDiagnostics::new()),
         };
 
-        let service_for_router = service.clone();
+        if service.prepare_ingress().is_err() {
+            warn!(
+                event = "ingress_generation_rejected",
+                "Transport must accept generation before connecting"
+            );
+        }
+        let owner = Arc::downgrade(service.external_owner.as_ref().unwrap());
+        let mut service_for_router = service.clone();
+        service_for_router.external_owner = None;
         thread::Builder::new()
             .name("unitree-dc-router".to_string())
             .spawn(move || {
-                service_for_router.run_message_loop(incoming_rx);
+                service_for_router.run_message_loop(incoming_rx, owner);
             })
             .expect("failed to spawn datachannel router thread");
 
@@ -255,10 +349,8 @@ where
         timeout_secs: Option<f64>,
         expectation: ResponseExpectation,
     ) -> PortResult<Value> {
-        if self.transport.ready_state() != "open" {
-            return Err("Data channel is not open".to_string());
-        }
-
+        let timeout = timeout_secs.unwrap_or(10.0);
+        let duration = validated_timeout(timeout)?;
         let effective_type = msg_type.unwrap_or(dc_types().msg);
         let key = Self::generate_message_key(
             effective_type,
@@ -266,15 +358,24 @@ where
             data.as_ref().and_then(Self::outgoing_identifier_from_data),
         );
 
+        let lifecycle = self.lifecycle_lock.lock().unwrap();
+        if self.transport.ready_state() != "open" {
+            return Err("Data channel is not open".to_string());
+        }
         let (tx, rx) = oneshot::channel::<PortResult<Value>>();
+        let token = Arc::new(());
         {
             let mut pending = self.pending_callbacks.lock().unwrap();
             if pending.contains_key(&key) {
                 return Err(format!("Duplicate in-flight request key: {key}"));
             }
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err("DataChannel in-flight request limit reached".into());
+            }
             pending.insert(
                 key.clone(),
                 PendingCallback {
+                    token: Arc::clone(&token),
                     sender: tx,
                     expectation,
                     session_id: self.session_id.load(Ordering::Relaxed),
@@ -282,24 +383,21 @@ where
             );
         }
 
-        if let Err(error) = self.send_message(topic, data, effective_type) {
-            self.drop_pending_callbacks(&key);
-            return Err(error);
-        }
+        let _pending_guard = PendingRequestGuard {
+            pending: &self.pending_callbacks,
+            chunks: &self.chunk_data_storage,
+            key: key.clone(),
+            token,
+        };
+        self.send_message_locked(topic, data, effective_type)?;
+        drop(lifecycle);
 
-        let timeout = timeout_secs.unwrap_or(10.0);
-        match tokio::time::timeout(Duration::from_secs_f64(timeout), rx).await {
+        match tokio::time::timeout(duration, rx).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => {
-                self.drop_pending_callbacks(&key);
-                Err("Response receiver dropped".to_string())
-            }
-            Err(_) => {
-                self.drop_pending_callbacks(&key);
-                Err(format!(
-                    "Publish timeout after {timeout:.1}s for topic {topic}"
-                ))
-            }
+            Ok(Err(_)) => Err("Response receiver dropped".to_string()),
+            Err(_) => Err(format!(
+                "Publish timeout after {timeout:.1}s for topic {topic}"
+            )),
         }
     }
 
@@ -309,10 +407,6 @@ where
         data: Option<Value>,
         msg_type: Option<&str>,
     ) -> PortResult<()> {
-        if self.transport.ready_state() != "open" {
-            return Err("Data channel is not open".to_string());
-        }
-
         let effective_type = msg_type.unwrap_or(dc_types().msg);
         self.send_message(topic, data, effective_type)
     }
@@ -366,29 +460,17 @@ where
     }
 
     pub fn subscribe(&self, topic: &str) -> PortResult<()> {
-        if self.transport.ready_state() != "open" {
-            return Err("Data channel is not open".to_string());
-        }
-
-        {
-            let mut subscriptions = self.subscriptions.lock().unwrap();
-            subscriptions.insert(topic.to_string());
-        }
-
-        self.publish_without_callback(topic, None, Some(dc_types().subscribe))
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        self.send_message_locked(topic, None, dc_types().subscribe)?;
+        self.subscriptions.lock().unwrap().insert(topic.to_owned());
+        Ok(())
     }
 
     pub fn unsubscribe(&self, topic: &str) -> PortResult<()> {
-        if self.transport.ready_state() != "open" {
-            return Err("Data channel is not open".to_string());
-        }
-
-        {
-            let mut subscriptions = self.subscriptions.lock().unwrap();
-            subscriptions.remove(topic);
-        }
-
-        self.publish_without_callback(topic, None, Some(dc_types().unsubscribe))
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        self.send_message_locked(topic, None, dc_types().unsubscribe)?;
+        self.subscriptions.lock().unwrap().remove(topic);
+        Ok(())
     }
 
     pub async fn disable_traffic_saving(&self, switch: bool) -> PortResult<bool> {
@@ -447,11 +529,11 @@ where
     }
 
     pub async fn wait_datachannel_open(&self, timeout_secs: f64) -> PortResult<()> {
-        let timeout = Duration::from_secs_f64(timeout_secs);
+        let timeout = validated_timeout(timeout_secs)?;
         let started_at = std::time::Instant::now();
 
         loop {
-            if self.data_channel_opened.load(Ordering::Relaxed) {
+            if self.is_open() {
                 return Ok(());
             }
 
@@ -506,9 +588,30 @@ where
     }
 
     pub fn start_new_session(&self) {
-        self.session_id
-            .store(Self::new_session_id(), Ordering::Relaxed);
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        self.diagnostics.reset();
+        let generation = self
+            .session_id
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        if self.transport.set_ingress_generation(generation).is_err() {
+            warn!(
+                event = "ingress_generation_rejected",
+                "Transport cannot prepare a new ingress session"
+            );
+        }
+        self.heartbeat_running.store(false, Ordering::Relaxed);
+        self.network_probe_running.store(false, Ordering::Relaxed);
+        self.data_channel_opened.store(false, Ordering::Relaxed);
+        self.heartbeat_last_response.store(0, Ordering::Relaxed);
+        self.chunk_data_storage.lock().unwrap().clear();
         self.fail_all_pending("DataChannel session reset");
+    }
+
+    pub fn prepare_ingress(&self) -> PortResult<()> {
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        self.transport
+            .set_ingress_generation(self.session_id.load(Ordering::SeqCst))
     }
 
     pub fn set_decoder(&self, decoder_type: &str) -> PortResult<()> {
@@ -536,28 +639,54 @@ where
         }
     }
 
-    fn run_message_loop(&self, incoming_rx: Receiver<DcMessage>) {
-        while let Ok(message) = incoming_rx.recv() {
-            match message {
-                DcMessage::Text(text) => match serde_json::from_str::<Value>(&text) {
-                    Ok(parsed) => {
-                        self.run_resolve(&parsed);
-                        self.handle_text_response(&parsed);
-                        self.dispatch_subscription(&parsed);
-                    }
-                    Err(error) => {
-                        warn!(
-                            event = "datachannel_json_parse_failed",
-                            error = %error,
-                            "Failed to parse text datachannel message"
-                        );
-                    }
-                },
-                DcMessage::Binary(binary) => {
-                    if let Some(parsed) = self.deal_array_buffer(&binary) {
-                        self.run_resolve(&parsed);
-                        self.dispatch_subscription(&parsed);
-                    }
+    fn run_message_loop(&self, incoming_rx: Receiver<IngressMessage>, owner: Weak<()>) {
+        while owner.upgrade().is_some() {
+            if let Some(fault) = self.transport.take_transport_error() {
+                self.process_ingress(fault);
+            }
+            self.expire_chunks();
+            let message = match incoming_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(message) => message,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            self.process_ingress(message);
+        }
+        self.stop_background_tasks();
+    }
+
+    fn process_ingress(&self, message: IngressMessage) {
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        if message.generation != self.session_id.load(Ordering::SeqCst) {
+            return;
+        }
+        match message.payload {
+            DcMessage::TransportFault(error) => {
+                let generation = self
+                    .session_id
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                if self.transport.set_ingress_generation(generation).is_err() {
+                    self.diagnostics.control_send.record();
+                }
+                self.data_channel_opened.store(false, Ordering::Relaxed);
+                self.heartbeat_running.store(false, Ordering::Relaxed);
+                self.network_probe_running.store(false, Ordering::Relaxed);
+                self.chunk_data_storage.lock().unwrap().clear();
+                self.fail_all_pending(&error);
+            }
+            DcMessage::Text(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(parsed) => {
+                    self.run_resolve(&parsed);
+                    self.handle_text_response(&parsed);
+                    self.dispatch_subscription(parsed);
+                }
+                Err(_) => self.diagnostics.parse.record(),
+            },
+            DcMessage::Binary(binary) => {
+                if let Some(parsed) = self.deal_array_buffer(&binary) {
+                    self.run_resolve(&parsed);
+                    self.dispatch_subscription(parsed);
                 }
             }
         }
@@ -572,114 +701,85 @@ where
             return;
         }
 
-        self.resolve_pending_response(&Self::incoming_key(message), message.clone());
+        self.resolve_pending_response(&Self::incoming_key(message), Cow::Borrowed(message));
     }
 
     fn handle_chunked_response(&self, message: &Value) -> bool {
+        let (metadata, payload, path) = match (
+            message.pointer("/data/content_info"),
+            message.pointer("/info/file"),
+        ) {
+            (Some(info), _)
+                if info.get("enable_chunking").and_then(Value::as_bool) == Some(true) =>
+            {
+                (info, message.pointer("/data/data"), "/data/data")
+            }
+            (_, Some(info))
+                if info.get("enable_chunking").and_then(Value::as_bool) == Some(true) =>
+            {
+                (info, info.get("data"), "/info/file/data")
+            }
+            _ => return false,
+        };
         let key = Self::incoming_key(message);
-
-        let content_chunk = message
-            .get("data")
-            .and_then(|value| value.get("content_info"))
-            .and_then(|value| value.get("enable_chunking"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        if content_chunk {
-            let chunk_index = message
-                .get("data")
-                .and_then(|value| value.get("content_info"))
-                .and_then(|value| value.get("chunk_index"))
+        let parse = || -> PortResult<Option<Vec<u8>>> {
+            let index = metadata
+                .get("chunk_index")
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let total_chunks = message
-                .get("data")
-                .and_then(|value| value.get("content_info"))
-                .and_then(|value| value.get("total_chunk_num"))
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or("Invalid chunk index")?;
+            let total = metadata
+                .get("total_chunk_num")
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
-
-            let bytes = message
-                .get("data")
-                .and_then(|value| value.get("data"))
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or("Invalid chunk count")?;
+            let bytes = payload
                 .and_then(Self::value_to_chunk_bytes)
-                .unwrap_or_default();
-
-            if total_chunks == 0 || chunk_index == 0 {
-                return false;
+                .ok_or("Invalid chunk bytes")?;
+            self.chunk_data_storage.lock().unwrap().insert(
+                &key,
+                path,
+                index,
+                total,
+                bytes,
+                std::time::Instant::now(),
+            )
+        };
+        match parse() {
+            Ok(Some(bytes)) => {
+                let mut merged = message.clone();
+                *merged
+                    .pointer_mut(path)
+                    .expect("validated chunk payload path") = Self::bytes_to_json_array(&bytes);
+                self.resolve_pending_response(&key, Cow::Owned(merged));
             }
-
-            let mut storage = self.chunk_data_storage.lock().unwrap();
-            storage.entry(key.clone()).or_default().push(bytes);
-
-            if chunk_index < total_chunks {
-                return true;
+            Ok(None) => {}
+            Err(error) => {
+                self.chunk_data_storage.lock().unwrap().remove(&key);
+                self.fail_pending(&key, &error);
+                self.diagnostics.chunk.record();
             }
-
-            if let Some(chunks) = storage.remove(&key) {
-                let merged = chunks.into_iter().flatten().collect::<Vec<u8>>();
-
-                let mut merged_message = message.clone();
-                merged_message["data"]["data"] = Self::bytes_to_json_array(&merged);
-
-                self.resolve_pending_response(&key, merged_message);
-            }
-
-            return true;
         }
-
-        let file_chunk = message
-            .get("info")
-            .and_then(|value| value.get("file"))
-            .and_then(|value| value.get("enable_chunking"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        if !file_chunk {
-            return false;
-        }
-
-        let chunk_index = message
-            .get("info")
-            .and_then(|value| value.get("file"))
-            .and_then(|value| value.get("chunk_index"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let total_chunks = message
-            .get("info")
-            .and_then(|value| value.get("file"))
-            .and_then(|value| value.get("total_chunk_num"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        let bytes = message
-            .get("info")
-            .and_then(|value| value.get("file"))
-            .and_then(|value| value.get("data"))
-            .and_then(Self::value_to_chunk_bytes)
-            .unwrap_or_default();
-
-        if total_chunks == 0 || chunk_index == 0 {
-            return false;
-        }
-
-        let mut storage = self.chunk_data_storage.lock().unwrap();
-        storage.entry(key.clone()).or_default().push(bytes);
-
-        if chunk_index < total_chunks {
-            return true;
-        }
-
-        if let Some(chunks) = storage.remove(&key) {
-            let merged = chunks.into_iter().flatten().collect::<Vec<u8>>();
-
-            let mut merged_message = message.clone();
-            merged_message["info"]["file"]["data"] = Self::bytes_to_json_array(&merged);
-
-            self.resolve_pending_response(&key, merged_message);
-        }
-
         true
+    }
+
+    fn expire_chunks(&self) {
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        let expired = self
+            .chunk_data_storage
+            .lock()
+            .unwrap()
+            .expire(std::time::Instant::now());
+        for key in expired {
+            self.fail_pending(&key, "Chunk assembly deadline expired");
+        }
+    }
+
+    fn fail_pending(&self, key: &str, error: &str) {
+        let callback = self.pending_callbacks.lock().unwrap().remove(key);
+        if let Some(callback) = callback {
+            let _ = callback.sender.send(Err(error.to_owned()));
+        }
     }
 
     fn handle_text_response(&self, message: &Value) {
@@ -720,7 +820,7 @@ where
             self.heartbeat_last_response
                 .store(Self::now_secs_u64(), Ordering::Relaxed);
             print_status("Data Channel", "verified");
-            self.start_heartbeat();
+            self.start_heartbeat_in_session();
             self.request_network_status_once();
             return;
         }
@@ -732,8 +832,11 @@ where
             }
 
             if let Ok(encrypted) = encrypt_key(key) {
-                let _ =
-                    self.send_message("", Some(Value::String(encrypted)), dc_types().validation);
+                let _ = self.send_message_locked(
+                    "",
+                    Some(Value::String(encrypted)),
+                    dc_types().validation,
+                );
             }
         }
     }
@@ -750,8 +853,11 @@ where
             }
 
             if let Ok(encrypted) = encrypt_key(&key) {
-                let _ =
-                    self.send_message("", Some(Value::String(encrypted)), dc_types().validation);
+                let _ = self.send_message_locked(
+                    "",
+                    Some(Value::String(encrypted)),
+                    dc_types().validation,
+                );
             }
         }
     }
@@ -759,13 +865,13 @@ where
     fn handle_rtc_inner_req(&self, message: &Value) {
         if let Some(info) = message.get("info") {
             if info.get("req_type").and_then(Value::as_str) == Some("rtt_probe_send_from_mechine") {
-                let _ = self.send_message("", Some(info.clone()), dc_types().rtc_inner_req);
+                let _ = self.send_message_locked("", Some(info.clone()), dc_types().rtc_inner_req);
             }
 
             if let Some(status) = info.get("status").and_then(Value::as_str) {
                 match status {
                     "NetworkStatus.ON_4G_CONNECTED" => {
-                        info!(
+                        debug!(
                             event = "network_status",
                             status = status,
                             mode = "4G",
@@ -779,7 +885,7 @@ where
                         } else {
                             "STA-L"
                         };
-                        info!(
+                        debug!(
                             event = "network_status",
                             status = status,
                             mode = mode,
@@ -797,10 +903,14 @@ where
         if !should_emit_error_log(message) {
             return;
         }
-        error!(event = "go2_error", payload = %message, "Error message received from Go2");
+        let error_count = message.get("data").and_then(Value::as_array).map(Vec::len);
+        error!(
+            event = "go2_error",
+            error_count, "Error message received from Go2"
+        );
     }
 
-    fn dispatch_subscription(&self, message: &Value) {
+    fn dispatch_subscription(&self, message: Value) {
         let topic = message
             .get("topic")
             .and_then(Value::as_str)
@@ -824,32 +934,34 @@ where
 
         let event = CallbackEvent::TopicCallback {
             topic: topic.to_string(),
-            payload: message.clone(),
+            payload: message,
         };
 
-        if let Err(error) = self.callback_events_tx.try_send(event) {
-            match error {
-                TrySendError::Full(_) => {
-                    warn!(
-                        event = "python_callback_drop",
-                        topic = topic,
-                        reason = "callback_queue_full",
-                        "Dropped callback event due to backpressure"
-                    );
-                }
-                TrySendError::Disconnected(_) => {
-                    warn!(
-                        event = "python_callback_drop",
-                        topic = topic,
-                        reason = "callback_dispatcher_disconnected",
-                        "Dropped callback event because dispatcher is unavailable"
-                    );
-                }
-            }
+        if self
+            .callback_events_tx
+            .for_generation(self.session_id.load(Ordering::SeqCst))
+            .try_send(event)
+            .is_err()
+        {
+            self.diagnostics.callback.record();
         }
     }
 
     fn send_message(&self, topic: &str, data: Option<Value>, msg_type: &str) -> PortResult<()> {
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        self.send_message_locked(topic, data, msg_type)
+    }
+
+    // Caller holds lifecycle_lock through readiness, registration and synchronous enqueue.
+    fn send_message_locked(
+        &self,
+        topic: &str,
+        data: Option<Value>,
+        msg_type: &str,
+    ) -> PortResult<()> {
+        if self.transport.ready_state() != "open" {
+            return Err("Data channel is not open".to_string());
+        }
         let mut message = json!({
             "type": msg_type,
             "topic": topic,
@@ -860,143 +972,88 @@ where
         }
 
         let text = serde_json::to_string(&message).map_err(|error| error.to_string())?;
-        self.transport.send_text(&text)
+        let result = self.transport.send_text(&text);
+        if result.is_err() {
+            self.diagnostics.control_send.record();
+        }
+        result
     }
 
     fn deal_array_buffer(&self, buffer: &[u8]) -> Option<Value> {
-        if buffer.len() < 4 {
-            warn!(
-                event = "binary_message_ignored",
-                reason = "buffer_too_short",
-                length = buffer.len(),
-                "Binary datachannel payload is too short"
-            );
-            return None;
-        }
-
-        let header_1 = u16::from_le_bytes([buffer[0], buffer[1]]);
-        let header_2 = u16::from_le_bytes([buffer[2], buffer[3]]);
-
-        if header_1 == 2 && header_2 == 0 {
-            self.deal_array_buffer_for_lidar(&buffer[4..])
-        } else {
-            self.deal_array_buffer_for_normal(buffer)
-        }
-    }
-
-    fn deal_array_buffer_for_normal(&self, buffer: &[u8]) -> Option<Value> {
-        if buffer.len() < 4 {
-            return None;
-        }
-
-        let header_length = u16::from_le_bytes([buffer[0], buffer[1]]) as usize;
-        let json_start = 4usize;
-        let json_end = json_start.checked_add(header_length)?;
-        if json_end > buffer.len() {
-            warn!(
-                event = "binary_message_ignored",
-                reason = "invalid_normal_header_length",
-                header_length,
-                payload_length = buffer.len(),
-                "Normal binary payload header length exceeds payload size"
-            );
-            return None;
-        }
-
-        let json_data = &buffer[json_start..json_end];
-        let binary_data = &buffer[json_end..];
-        let decoded_json = match serde_json::from_slice::<Value>(json_data) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    event = "binary_json_parse_failed",
-                    reason = "normal",
-                    error = %error,
-                    "Failed to parse normal binary payload JSON header"
-                );
-                return None;
+        match super::framing::parse(buffer) {
+            Ok((frame, header, payload)) => self.process_binary_payload(frame, header, payload),
+            Err(_) => {
+                self.diagnostics.binary.record();
+                None
             }
-        };
-
-        self.process_binary_payload(decoded_json, binary_data)
+        }
     }
 
-    fn deal_array_buffer_for_lidar(&self, buffer: &[u8]) -> Option<Value> {
-        if buffer.len() < 8 {
-            return None;
-        }
-
-        let header_length =
-            u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-        let json_start = 8usize;
-        let json_end = json_start.checked_add(header_length)?;
-        if json_end > buffer.len() {
-            warn!(
-                event = "binary_message_ignored",
-                reason = "invalid_lidar_header_length",
-                header_length,
-                payload_length = buffer.len(),
-                "LiDAR binary payload header length exceeds payload size"
-            );
-            return None;
-        }
-
-        let json_data = &buffer[json_start..json_end];
-        let binary_data = &buffer[json_end..];
-        let decoded_json = match serde_json::from_slice::<Value>(json_data) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    event = "binary_json_parse_failed",
-                    reason = "lidar",
-                    error = %error,
-                    "Failed to parse LiDAR binary payload JSON header"
-                );
-                return None;
-            }
-        };
-
-        self.process_binary_payload(decoded_json, binary_data)
-    }
-
-    fn process_binary_payload(&self, mut decoded_json: Value, binary_data: &[u8]) -> Option<Value> {
+    fn process_binary_payload(
+        &self,
+        frame: super::framing::BinaryFrame,
+        mut decoded_json: Value,
+        binary_data: &[u8],
+    ) -> Option<Value> {
         let topic_or_type = decoded_json
             .get("topic")
             .and_then(Value::as_str)
             .or_else(|| decoded_json.get("type").and_then(Value::as_str))
             .unwrap_or_default()
-            .to_string();
-
+            .to_owned();
+        let data = decoded_json.get("data");
+        let lidar_intent = frame == super::framing::BinaryFrame::Lidar
+            || topic_or_type.starts_with("rt/utlidar/")
+            || data.is_some_and(|data| {
+                data.get("src_size").is_some()
+                    || (data.get("origin").is_some() && data.get("resolution").is_some())
+            });
+        let metadata = data.and_then(LidarMetadata::from_json);
+        if lidar_intent && metadata.is_none() {
+            self.reject_binary_response(&decoded_json, "Invalid LiDAR metadata");
+            return None;
+        }
+        if let Some(metadata) = metadata {
+            if binary_data.len() > crate::datachannel::lidar::MAX_COMPRESSED_BYTES {
+                self.reject_binary_response(
+                    &decoded_json,
+                    "LiDAR compressed size exceeds resource budget",
+                );
+                return None;
+            }
+            if self.decoder_type.lock().unwrap().as_str() != "native" {
+                self.reject_binary_response(&decoded_json, "Unsupported LiDAR decoder");
+                return None;
+            }
+            if !self.should_process(&topic_or_type) {
+                return None;
+            }
+            let key = Self::incoming_key(&decoded_json);
+            let request = LidarDecodeRequest {
+                generation: self.session_id.load(Ordering::SeqCst),
+                topic: topic_or_type.clone(),
+                payload: decoded_json,
+                compressed_data: Bytes::copy_from_slice(binary_data),
+                metadata,
+            };
+            if let Err(error) = self.lidar_worker_pool.submit(request) {
+                self.fail_pending(&key, &error);
+                self.diagnostics.lidar_submit.record();
+            }
+            return None;
+        }
         if !self.should_process(&topic_or_type) {
             return None;
         }
-
-        let metadata = decoded_json.get("data").and_then(LidarMetadata::from_json);
-        let decoder_type = self.decoder_type.lock().unwrap().clone();
-
-        if let Some(metadata) = metadata {
-            if decoder_type == "native" {
-                let request = LidarDecodeRequest {
-                    topic: topic_or_type.clone(),
-                    payload: decoded_json,
-                    compressed_data: Bytes::copy_from_slice(binary_data),
-                    metadata,
-                };
-
-                if let Err(error) = self.lidar_worker_pool.submit(request) {
-                    warn!(
-                        event = "lidar_worker_submit_failed",
-                        topic = topic_or_type,
-                        error = %error,
-                        "Failed to submit LiDAR decode request to worker pool"
-                    );
-                }
-                return None;
-            }
-        }
-
         Self::inject_binary_data(&mut decoded_json, binary_data);
         Some(decoded_json)
+    }
+
+    fn reject_binary_response(&self, message: &Value, reason: &str) {
+        let key = Self::incoming_key(message);
+        self.chunk_data_storage.lock().unwrap().remove(&key);
+        self.fail_pending(&key, reason);
+        self.diagnostics.lidar_invalid.record();
     }
 
     fn inject_binary_data(decoded_json: &mut Value, binary_data: &[u8]) {
@@ -1013,7 +1070,14 @@ where
         }
     }
 
+    #[cfg(test)]
     fn start_heartbeat(&self) {
+        let _lifecycle = self.lifecycle_lock.lock().unwrap();
+        self.start_heartbeat_in_session();
+    }
+
+    // Caller owns lifecycle_lock across ingress handling or explicit test startup.
+    fn start_heartbeat_in_session(&self) {
         if self
             .heartbeat_running
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -1022,11 +1086,21 @@ where
             return;
         }
 
-        let service = self.clone();
+        let epoch = self.session_id.load(Ordering::SeqCst);
+        let owner = self.owner_lifetime.clone();
+        let mut service = self.clone();
+        service.external_owner = None;
         thread::Builder::new()
             .name("unitree-heartbeat".to_string())
             .spawn(move || {
-                while service.heartbeat_running.load(Ordering::Relaxed) {
+                while service.heartbeat_running.load(Ordering::Relaxed)
+                    && service.session_id.load(Ordering::SeqCst) == epoch
+                    && owner.upgrade().is_some()
+                {
+                    let lifecycle = service.lifecycle_lock.lock().unwrap();
+                    if service.session_id.load(Ordering::SeqCst) != epoch {
+                        break;
+                    }
                     let now = Self::now_secs_u64();
                     let last = service.heartbeat_last_response.load(Ordering::Relaxed);
                     if last > 0 && now.saturating_sub(last) > 6 {
@@ -1037,6 +1111,8 @@ where
                         );
                         service.heartbeat_running.store(false, Ordering::Relaxed);
                         service.data_channel_opened.store(false, Ordering::Relaxed);
+                        service.fail_all_pending("Heartbeat timeout");
+                        service.chunk_data_storage.lock().unwrap().clear();
                         break;
                     }
 
@@ -1046,9 +1122,10 @@ where
                             "timeInStr": formatted,
                             "timeInNum": now,
                         });
-                        let _ = service.send_message("", Some(data), dc_types().heartbeat);
+                        let _ = service.send_message_locked("", Some(data), dc_types().heartbeat);
                     }
 
+                    drop(lifecycle);
                     thread::sleep(Duration::from_secs(2));
                 }
             })
@@ -1070,7 +1147,7 @@ where
             "uuid": req_uuid,
         });
 
-        let _ = self.send_message("", Some(data), dc_types().rtc_inner_req);
+        let _ = self.send_message_locked("", Some(data), dc_types().rtc_inner_req);
     }
 
     fn incoming_key(message: &Value) -> String {
@@ -1112,17 +1189,18 @@ where
 
     fn value_to_chunk_bytes(value: &Value) -> Option<Vec<u8>> {
         if let Some(text) = value.as_str() {
-            return Some(text.as_bytes().to_vec());
+            return (text.len() <= super::chunks::MAX_TRANSFER_BYTES)
+                .then(|| text.as_bytes().to_vec());
+        }
+        if value.as_array()?.len() > super::chunks::MAX_TRANSFER_BYTES {
+            return None;
         }
 
-        let array = value.as_array()?;
-        let mut output = Vec::with_capacity(array.len());
-        for element in array {
-            let byte = element.as_u64()?;
-            output.push(byte as u8);
-        }
-
-        Some(output)
+        value
+            .as_array()?
+            .iter()
+            .map(|element| u8::try_from(element.as_u64()?).ok())
+            .collect()
     }
 
     fn bytes_to_json_array(bytes: &[u8]) -> Value {
@@ -1134,12 +1212,13 @@ where
         )
     }
 
+    #[cfg(test)]
     fn drop_pending_callbacks(&self, key: &str) {
-        let mut pending = self.pending_callbacks.lock().unwrap();
-        pending.remove(key);
+        self.pending_callbacks.lock().unwrap().remove(key);
+        self.chunk_data_storage.lock().unwrap().remove(key);
     }
 
-    fn resolve_pending_response(&self, key: &str, message: Value) {
+    fn resolve_pending_response(&self, key: &str, message: Cow<'_, Value>) {
         let callback = {
             let mut pending = self.pending_callbacks.lock().unwrap();
             pending.remove(key)
@@ -1153,7 +1232,10 @@ where
         let result = if callback.session_id != current_session {
             Err("Response belongs to a stale DataChannel session".to_string())
         } else {
-            callback.expectation.validate(&message).map(|_| message)
+            callback
+                .expectation
+                .validate(&message)
+                .map(|_| message.into_owned())
         };
 
         let _ = callback.sender.send(result);
@@ -1226,6 +1308,18 @@ fn should_emit_error_log(message: &Value) -> bool {
     }
 }
 
+pub(crate) fn validated_timeout(seconds: f64) -> PortResult<Duration> {
+    let invalid = || {
+        "Invalid timeout: expected finite nonnegative seconds representable as a deadline"
+            .to_owned()
+    };
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| invalid())?;
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(invalid)?;
+    Ok(duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,10 +1334,19 @@ mod tests {
     struct MockDataChannel {
         state: &'static str,
         sent: Arc<Mutex<Vec<String>>>,
+        reject_send: AtomicBool,
+        send_barriers: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     }
 
     impl DataChannelPort for MockDataChannel {
         fn send_text(&self, message: &str) -> PortResult<()> {
+            if self.reject_send.load(Ordering::SeqCst) {
+                return Err("Rejected send".into());
+            }
+            if let Some((entered, release)) = self.send_barriers.lock().unwrap().take() {
+                entered.wait();
+                release.wait();
+            }
             self.sent.lock().unwrap().push(message.to_string());
             Ok(())
         }
@@ -1254,8 +1357,12 @@ mod tests {
 
         fn set_message_sender(
             &self,
-            _sender: crossbeam_channel::Sender<DcMessage>,
+            _sender: crossbeam_channel::Sender<IngressMessage>,
         ) -> PortResult<()> {
+            Ok(())
+        }
+
+        fn set_ingress_generation(&self, _generation: u64) -> PortResult<()> {
             Ok(())
         }
 
@@ -1264,16 +1371,508 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pending_request_admission_is_bounded_before_sending() {
+        let (service, channel, _tx, _rx) = make_service("open");
+        for index in 0..128 {
+            let (sender, _) = oneshot::channel();
+            service.pending_callbacks.lock().unwrap().insert(
+                format!("fixture-{index}"),
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender,
+                    expectation: ResponseExpectation::any(),
+                    session_id: service.session_id.load(Ordering::SeqCst),
+                },
+            );
+        }
+        let error = service
+            .publish("bounded", None, None, Some(0.0))
+            .await
+            .unwrap_err();
+        assert!(error.contains("in-flight request limit"), "{error}");
+        assert!(channel.sent.lock().unwrap().is_empty());
+        assert_eq!(service.pending_callbacks.lock().unwrap().len(), 128);
+        service.start_new_session();
+        assert!(service.pending_callbacks.lock().unwrap().is_empty());
+        // The reset releases admission, even though this fixture has no reply producer.
+        assert!(service
+            .publish("bounded", None, None, Some(0.0))
+            .await
+            .unwrap_err()
+            .contains("timeout"));
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transport_fault_fails_pending_without_response_timeout() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let (sender, receiver) = oneshot::channel();
+        let generation = service.session_id.load(Ordering::SeqCst);
+        service.pending_callbacks.lock().unwrap().insert(
+            "pending".into(),
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::any(),
+                session_id: generation,
+            },
+        );
+        service.process_ingress(
+            DcMessage::TransportFault("DataChannel send failed".into()).for_generation(generation),
+        );
+        assert_eq!(
+            receiver.await.unwrap().unwrap_err(),
+            "DataChannel send failed"
+        );
+        assert!(service.pending_callbacks.lock().unwrap().is_empty());
+        assert!(!service.is_open());
+    }
+
+    #[test]
+    fn pending_registration_and_enqueue_finish_before_reset() {
+        use std::sync::Barrier;
+        let (service, channel, _tx, _rx) = make_service("open");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let publisher = service.clone();
+        let publish = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(publisher.publish("topic", None, None, Some(1.0)))
+        });
+        entered.wait();
+        assert_eq!(service.pending_callbacks.lock().unwrap().len(), 1);
+        let resetting = service.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reset = thread::spawn(move || {
+            resetting.start_new_session();
+            done_tx.send(()).unwrap();
+        });
+        let reset_was_blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+        release.wait();
+        reset.join().unwrap();
+        assert!(publish
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("session reset"));
+        assert!(reset_was_blocked);
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+        assert!(service.pending_callbacks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_cannot_pass_an_outbound_admission_in_progress() {
+        use std::sync::Barrier;
+        let (service, channel, _tx, _rx) = make_service("open");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let publisher = service.clone();
+        let publish =
+            thread::spawn(move || publisher.publish_without_callback("topic", None, None));
+        entered.wait();
+        let resetting = service.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reset = thread::spawn(move || {
+            resetting.start_new_session();
+            done_tx.send(()).unwrap();
+        });
+        let reset_was_blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+        release.wait();
+        publish.join().unwrap().unwrap();
+        reset.join().unwrap();
+        assert!(
+            reset_was_blocked,
+            "reset passed an admitted send before synchronous enqueue completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_timeouts_are_rejected_before_send() {
+        for seconds in [f64::NAN, f64::INFINITY, -1.0, f64::MAX, 1e19] {
+            let (service, channel, _tx, _rx) = make_service("open");
+            assert!(service
+                .publish("topic", None, None, Some(seconds))
+                .await
+                .is_err());
+            assert!(channel.sent.lock().unwrap().is_empty());
+            assert!(service.pending_callbacks.lock().unwrap().is_empty());
+            assert!(service.wait_datachannel_open(seconds).await.is_err());
+        }
+    }
+
+    #[test]
+    fn chunk_bytes_reject_out_of_range_values() {
+        assert_eq!(
+            DataChannelService::<MockDataChannel>::value_to_chunk_bytes(&json!([0, 255])),
+            Some(vec![0, 255])
+        );
+        assert!(
+            DataChannelService::<MockDataChannel>::value_to_chunk_bytes(&json!([256])).is_none()
+        );
+        assert!(
+            DataChannelService::<MockDataChannel>::value_to_chunk_bytes(&json!([-1])).is_none()
+        );
+    }
+
+    #[test]
+    fn chunk_final_index_does_not_complete_missing_chunks() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let message = json!({"type":"res", "topic":"topic", "data":{"content_info":{"enable_chunking":true,"chunk_index":2,"total_chunk_num":2},"data":[2]}});
+        assert!(service.handle_chunked_response(&message));
+        assert!(!service.chunk_data_storage.lock().unwrap().is_empty());
+        service.start_new_session();
+        assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn router_releases_transport_when_external_owners_drop() {
+        let (service, channel, _tx, _rx) = make_service("open");
+        let weak = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "router must not own the service lifetime"
+        );
+    }
+
+    #[test]
+    fn heartbeat_reconnect_does_not_revive_old_worker() {
+        let (service, channel, _tx, _rx) = make_service("open");
+        service.start_heartbeat();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while channel.sent.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+        service.start_new_session();
+        service.start_heartbeat();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while channel.sent.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(channel.sent.lock().unwrap().len(), 2);
+        std::thread::sleep(Duration::from_millis(2200));
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            3,
+            "only the new epoch sends its next heartbeat"
+        );
+        service.stop_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn validated_flag_alone_does_not_make_closed_transport_ready() {
+        let (service, _channel, _tx, _rx) = make_service("closed");
+        service.data_channel_opened.store(true, Ordering::Relaxed);
+        assert!(service.wait_datachannel_open(0.0).await.is_err());
+    }
+
+    #[test]
+    fn both_chunk_schemas_reassemble_in_index_order() {
+        for path in ["content", "file"] {
+            let (service, _channel, _tx, _rx) = make_service("open");
+            let mut message = json!({"type":"res", "topic":"topic"});
+            if path == "content" {
+                message["data"] = json!({"content_info":{"enable_chunking":true,"chunk_index":2,"total_chunk_num":2},"data":[2]});
+            } else {
+                message["info"] = json!({"file":{"enable_chunking":true,"chunk_index":2,"total_chunk_num":2,"data":[2]}});
+            }
+            let key = DataChannelService::<MockDataChannel>::incoming_key(&message);
+            let (tx, mut rx) = oneshot::channel();
+            service.pending_callbacks.lock().unwrap().insert(
+                key,
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender: tx,
+                    expectation: ResponseExpectation::any(),
+                    session_id: service.session_id.load(Ordering::Relaxed),
+                },
+            );
+            assert!(service.handle_chunked_response(&message));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(service.handle_chunked_response(&message));
+            let (metadata_path, data_path) = if path == "content" {
+                ("/data/content_info/chunk_index", "/data/data")
+            } else {
+                ("/info/file/chunk_index", "/info/file/data")
+            };
+            *message.pointer_mut(metadata_path).unwrap() = json!(1);
+            *message.pointer_mut(data_path).unwrap() = json!([1]);
+            assert!(service.handle_chunked_response(&message));
+            assert_eq!(
+                rx.try_recv().unwrap().unwrap().pointer(data_path).unwrap(),
+                &json!([1, 2])
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_chunk_fails_pending_without_partial_success() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let message = json!({"type":"res", "topic":"topic", "data":{"content_info":{"enable_chunking":true,"chunk_index":0,"total_chunk_num":2},"data":[256]}});
+        let key = DataChannelService::<MockDataChannel>::incoming_key(&message);
+        let (tx, mut rx) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            key,
+            PendingCallback {
+                token: Arc::new(()),
+                sender: tx,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        service.run_resolve(&message);
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_cleanup_discards_partial_chunks() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let message = json!({"type":"res", "topic":"topic", "data":{"content_info":{"enable_chunking":true,"chunk_index":1,"total_chunk_num":2},"data":[1]}});
+        service.handle_chunked_response(&message);
+        assert!(!service.chunk_data_storage.lock().unwrap().is_empty());
+        service.drop_pending_callbacks(&DataChannelService::<MockDataChannel>::incoming_key(
+            &message,
+        ));
+        assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_reclaims_pending_and_partial_chunks() {
+        let (service, channel, _tx, _rx) = make_service("open");
+        let requester = service.clone();
+        let task =
+            tokio::spawn(async move { requester.publish("topic", None, None, Some(3600.0)).await });
+        while channel.sent.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let message = json!({"type":"msg", "topic":"topic", "data":{"content_info":{"enable_chunking":true,"chunk_index":1,"total_chunk_num":2},"data":[1]}});
+        service.handle_chunked_response(&message);
+        assert!(!service.chunk_data_storage.lock().unwrap().is_empty());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(service.pending_callbacks.lock().unwrap().is_empty());
+        assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_lidar_metadata_never_falls_back_to_raw_binary() {
+        for data in [
+            json!({"origin":[0,0,0],"resolution":0.1,"src_size":usize::MAX}),
+            json!({"origin":[0,0],"resolution":0.1,"src_size":1}),
+            json!({"origin":[0,0,0],"resolution":0.0,"src_size":1}),
+        ] {
+            let (service, _channel, _tx, _rx) = make_service("open");
+            let message = json!({"type":"msg", "topic":"rt/custom", "data":data});
+            let json = serde_json::to_vec(&message).unwrap();
+            let mut frame = (json.len() as u16).to_le_bytes().to_vec();
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(&json);
+            frame.push(1);
+            assert!(service.deal_array_buffer(&frame).is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_lidar_compressed_payload_rejects_before_worker_handoff() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let message = json!({"type":"msg", "topic":"rt/custom", "data":{"origin":[0,0,0],"resolution":0.1,"src_size":1}});
+        let key = DataChannelService::<MockDataChannel>::incoming_key(&message);
+        let (tx, mut rx) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            key,
+            PendingCallback {
+                token: Arc::new(()),
+                sender: tx,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        let json = serde_json::to_vec(&message).unwrap();
+        let mut frame = (json.len() as u16).to_le_bytes().to_vec();
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&json);
+        frame.resize(
+            frame.len() + crate::datachannel::lidar::MAX_COMPRESSED_BYTES + 1,
+            0,
+        );
+        assert!(service.deal_array_buffer(&frame).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn cancelled_old_request_guard_preserves_replacement() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let guard = PendingRequestGuard {
+            pending: &service.pending_callbacks,
+            chunks: &service.chunk_data_storage,
+            key: "same-key".into(),
+            token: Arc::new(()),
+        };
+        let (sender, _receiver) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            "same-key".into(),
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        service
+            .chunk_data_storage
+            .lock()
+            .unwrap()
+            .insert(
+                "same-key",
+                "content",
+                1,
+                2,
+                vec![1],
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        drop(guard);
+        assert!(service
+            .pending_callbacks
+            .lock()
+            .unwrap()
+            .contains_key("same-key"));
+        assert!(!service.chunk_data_storage.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn subscription_sets_commit_only_after_accepted_send() {
+        let (service, channel, _tx, _rx) = make_service("open");
+        channel.reject_send.store(true, Ordering::SeqCst);
+        assert!(service.subscribe("topic").is_err());
+        assert!(!service.subscriptions.lock().unwrap().contains("topic"));
+        channel.reject_send.store(false, Ordering::SeqCst);
+        service.subscribe("topic").unwrap();
+        channel.reject_send.store(true, Ordering::SeqCst);
+        assert!(service.unsubscribe("topic").is_err());
+        assert!(service.subscriptions.lock().unwrap().contains("topic"));
+    }
+
+    #[test]
+    fn stale_ingress_cannot_validate_or_retain_chunks() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let old = service.session_id.load(Ordering::SeqCst);
+        service.start_new_session();
+        service.process_ingress(
+            DcMessage::Text(json!({"type":"validation","data":"Validation Ok."}).to_string())
+                .for_generation(old),
+        );
+        assert!(!service.data_channel_opened.load(Ordering::SeqCst));
+        service.process_ingress(
+            DcMessage::Text(json!({"type":"heartbeat"}).to_string()).for_generation(old),
+        );
+        assert_eq!(service.heartbeat_last_response.load(Ordering::SeqCst), 0);
+        service.process_ingress(DcMessage::Text(json!({"type":"res", "topic":"topic", "data":{"content_info":{"enable_chunking":true,"chunk_index":1,"total_chunk_num":2},"data":[1]}}).to_string()).for_generation(old));
+        assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_response_cannot_resolve_reused_user_request_id() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let old = service.session_id.load(Ordering::SeqCst);
+        service.start_new_session();
+        let response = json!({"type":"res","topic":"rt/api/sport/response","data":{"header":{"identity":{"id":42,"api_id":1001}}}});
+        let key = DataChannelService::<MockDataChannel>::incoming_key(&response);
+        let (sender, mut receiver) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            key,
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::for_api_request("rt/api/sport/request", 1001),
+                session_id: service.session_id.load(Ordering::SeqCst),
+            },
+        );
+        service.process_ingress(DcMessage::Text(response.to_string()).for_generation(old));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        service.process_ingress(
+            DcMessage::Text(response.to_string())
+                .for_generation(service.session_id.load(Ordering::SeqCst)),
+        );
+        assert!(receiver.try_recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn ingress_generation_is_checked_after_acquiring_processing_lock() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let epoch = service.session_id.load(Ordering::SeqCst);
+        let guard = service.lifecycle_lock.lock().unwrap();
+        let worker = service.clone();
+        let (started_tx, started_rx) = bounded(1);
+        let (done_tx, done_rx) = bounded(1);
+        let task = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker.process_ingress(
+                DcMessage::Text(json!({"type":"validation","data":"Validation Ok."}).to_string())
+                    .for_generation(epoch),
+            );
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "processing must wait for lifecycle lock"
+        );
+        // Model a reset after dequeue while processing is gated; no new envelope may be stamped with the old epoch.
+        service.session_id.fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        task.join().unwrap();
+        assert!(!service.data_channel_opened.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn malformed_binary_header_does_not_kill_router() {
+        let (service, _channel, sender, events) = make_service("open");
+        service.subscribe("topic").unwrap();
+        let mut frame = vec![4, 0, 0, 0];
+        frame.extend_from_slice(b"true");
+        sender.send(DcMessage::Binary(frame.into())).unwrap();
+        sender
+            .send(DcMessage::Text(
+                json!({"type":"msg","topic":"topic","data":1}).to_string(),
+            ))
+            .unwrap();
+        let event = events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(event, CallbackEvent::TopicCallback {payload,..} if payload["data"] == 1));
+    }
+
     #[test]
     fn publish_request_builds_payload() {
         // Verify that publish_without_callback produces a correctly-shaped outgoing "msg"
         // frame over the DataChannel — this is the send path that publish_request shares.
-        let (_dc_tx, dc_rx) = bounded::<DcMessage>(32);
-        let (callback_tx, _callback_rx) = bounded::<CallbackEvent>(32);
+        let (_dc_tx, dc_rx) = bounded::<IngressMessage>(32);
+        let (callback_tx, _callback_rx) = event_channel(32).unwrap();
         let lidar_pool = crate::datachannel::lidar::create_worker_pool(callback_tx.clone());
         let channel = Arc::new(MockDataChannel {
             state: "open",
             sent: Arc::new(Mutex::new(Vec::new())),
+            reject_send: AtomicBool::new(false),
+            send_barriers: Mutex::new(None),
         });
 
         let service =
@@ -1311,7 +1910,63 @@ mod tests {
         assert!(should_emit_error_log(&message));
     }
 
+    #[test]
+    fn peer_error_log_omits_raw_payload_and_preserves_subscription() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (service, _, _, callback_rx) = make_service("open");
+        service.subscribe("errors").unwrap();
+        let secret = "sentinel-private-key".repeat(1024);
+        let message = json!({"type": "errors", "topic": "errors", "data": [secret]});
+        let expected = message.clone();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&bytes);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(Arc::clone(&output)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            service.handle_error_message(&message);
+            service.dispatch_subscription(message);
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("ERROR"));
+        assert!(log.contains("go2_error"));
+        assert!(!log.contains("sentinel-private-key"));
+        assert!(log.contains("error_count=1"));
+        assert!(log.len() < 512);
+        assert!(
+            matches!(callback_rx.try_recv().unwrap(), CallbackEvent::TopicCallback { payload, .. } if payload == expected)
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
+    #[derive(Clone)]
+    struct FixtureSender {
+        sender: crossbeam_channel::Sender<IngressMessage>,
+        generation: Arc<AtomicU64>,
+    }
+
+    impl FixtureSender {
+        fn send(
+            &self,
+            message: DcMessage,
+        ) -> Result<(), crossbeam_channel::SendError<IngressMessage>> {
+            self.sender
+                .send(message.for_generation(self.generation.load(Ordering::SeqCst)))
+        }
+    }
+
     // Helper: creates a DataChannelService with a MockDataChannel and returns
     // all channels needed for test assertions.
     // ─────────────────────────────────────────────────────────────────────────
@@ -1320,19 +1975,161 @@ mod tests {
     ) -> (
         DataChannelService<MockDataChannel>,
         Arc<MockDataChannel>,
-        crossbeam_channel::Sender<DcMessage>,
-        crossbeam_channel::Receiver<CallbackEvent>,
+        FixtureSender,
+        EventReceiver,
     ) {
-        let (dc_tx, dc_rx) = bounded::<DcMessage>(64);
-        let (cb_tx, cb_rx) = bounded::<CallbackEvent>(64);
+        let (dc_tx, dc_rx) = bounded::<IngressMessage>(64);
+        let (cb_tx, cb_rx) = event_channel(64).unwrap();
         let lidar_pool = crate::datachannel::lidar::create_worker_pool(cb_tx.clone());
         let channel = Arc::new(MockDataChannel {
             state,
             sent: Arc::new(Mutex::new(Vec::new())),
+            reject_send: AtomicBool::new(false),
+            send_barriers: Mutex::new(None),
         });
         let service =
             DataChannelService::new(Arc::clone(&channel), dc_rx, cb_tx, lidar_pool, false);
-        (service, channel, dc_tx, cb_rx)
+        let sender = FixtureSender {
+            sender: dc_tx,
+            generation: Arc::clone(&service.session_id),
+        };
+        (service, channel, sender, cb_rx)
+    }
+
+    #[test]
+    fn subscription_moves_original_json_allocation_with_or_without_waiter() {
+        for has_waiter in [false, true] {
+            let (service, _channel, _ingress, events) = make_service("open");
+            service.subscribe("topic").unwrap();
+            let message = json!({"type":"res", "topic":"topic", "data":"owned-payload"});
+            let original = message["data"].as_str().unwrap().as_ptr();
+            let mut response = has_waiter.then(|| {
+                let (sender, receiver) = oneshot::channel();
+                service.pending_callbacks.lock().unwrap().insert(
+                    DataChannelService::<MockDataChannel>::incoming_key(&message),
+                    PendingCallback {
+                        token: Arc::new(()),
+                        sender,
+                        expectation: ResponseExpectation::any(),
+                        session_id: service.session_id.load(Ordering::Relaxed),
+                    },
+                );
+                receiver
+            });
+            service.run_resolve(&message);
+            let resolved = response.as_mut().map(|rx| rx.try_recv().unwrap().unwrap());
+            if let Some(resolved) = &resolved {
+                assert_eq!(resolved, &message);
+                assert_ne!(resolved["data"].as_str().unwrap().as_ptr(), original);
+            }
+            service.dispatch_subscription(message);
+            let CallbackEvent::TopicCallback { payload, .. } = events.try_recv().unwrap() else {
+                panic!("expected topic callback");
+            };
+            assert_eq!(payload["data"], "owned-payload");
+            assert_eq!(payload["data"].as_str().unwrap().as_ptr(), original);
+        }
+    }
+
+    #[test]
+    fn owned_pending_response_preserves_json_allocation() {
+        let (service, _channel, _ingress, _events) = make_service("open");
+        let message = json!({"type":"res", "topic":"topic", "data":"merged-payload"});
+        let original = message["data"].as_str().unwrap().as_ptr();
+        let key = DataChannelService::<MockDataChannel>::incoming_key(&message);
+        let (sender, mut response) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            key.clone(),
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        service.resolve_pending_response(&key, Cow::Owned(message));
+        let resolved = response.try_recv().unwrap().unwrap();
+        assert_eq!(resolved["data"].as_str().unwrap().as_ptr(), original);
+    }
+
+    #[test]
+    fn subscription_quota_failure_does_not_prevent_pending_completion() {
+        let (service, _channel, _ingress, events) = make_service("open");
+        service.subscribe("topic").unwrap();
+        let message = json!({"type":"res", "topic":"topic", "data":"payload"});
+        for _ in 0..64 {
+            service.dispatch_subscription(message.clone());
+        }
+        let (sender, mut response) = oneshot::channel();
+        service.pending_callbacks.lock().unwrap().insert(
+            DataChannelService::<MockDataChannel>::incoming_key(&message),
+            PendingCallback {
+                token: Arc::new(()),
+                sender,
+                expectation: ResponseExpectation::any(),
+                session_id: service.session_id.load(Ordering::Relaxed),
+            },
+        );
+        service.process_ingress(
+            DcMessage::Text(message.to_string())
+                .for_generation(service.session_id.load(Ordering::Relaxed)),
+        );
+        assert_eq!(response.try_recv().unwrap().unwrap(), message);
+        for _ in 0..64 {
+            assert!(events.try_recv().is_ok());
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn chunk_waiter_merges_but_subscriber_receives_original_chunks_in_both_schemas() {
+        for file_schema in [false, true] {
+            let (service, _channel, _ingress, events) = make_service("open");
+            service.subscribe("topic").unwrap();
+            let mut first = json!({"type":"res", "topic":"topic"});
+            let metadata = json!({"enable_chunking":true,"chunk_index":1,"total_chunk_num":2});
+            let (index_path, payload_path) = if file_schema {
+                first["info"] = json!({"file":metadata});
+                first["info"]["file"]["data"] = json!([65]);
+                ("/info/file/chunk_index", "/info/file/data")
+            } else {
+                first["data"] = json!({"content_info":metadata,"data":[65]});
+                ("/data/content_info/chunk_index", "/data/data")
+            };
+            let (sender, mut response) = oneshot::channel();
+            service.pending_callbacks.lock().unwrap().insert(
+                DataChannelService::<MockDataChannel>::incoming_key(&first),
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender,
+                    expectation: ResponseExpectation::any(),
+                    session_id: service.session_id.load(Ordering::Relaxed),
+                },
+            );
+            let mut second = first.clone();
+            *second.pointer_mut(index_path).unwrap() = json!(2);
+            *second.pointer_mut(payload_path).unwrap() = json!([66]);
+            for (index, chunk) in [first, second].into_iter().enumerate() {
+                service.process_ingress(
+                    DcMessage::Text(chunk.to_string())
+                        .for_generation(service.session_id.load(Ordering::Relaxed)),
+                );
+                let CallbackEvent::TopicCallback { payload, .. } = events.try_recv().unwrap()
+                else {
+                    panic!("expected original chunk callback");
+                };
+                assert_eq!(payload, chunk);
+                if index == 0 {
+                    assert!(matches!(
+                        response.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+            let merged = response.try_recv().unwrap().unwrap();
+            assert_eq!(merged.pointer(payload_path).unwrap(), &json!([65, 66]));
+            assert!(events.try_recv().is_err());
+        }
     }
 
     // ── subscribe ─────────────────────────────────────────────────────────────
@@ -1692,18 +2489,14 @@ mod tests {
         assert_eq!(parsed["topic"], "rt/custom");
     }
 
-    /// Binary with header_1=2, header_2=0 is routed to the LiDAR path (deal_array_buffer_for_lidar).
-    /// With a topic in JSON but no metadata, process_binary_payload returns Some (non-lidar path).
-    /// With valid LiDAR metadata *and* the native decoder active, it would return None (submitted to worker).
+    /// Tagged LiDAR frames cannot fall back to unvalidated raw JSON.
     #[test]
-    fn binary_lidar_tag_routes_to_lidar_path() {
+    fn binary_lidar_tag_rejects_missing_metadata() {
         let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
 
         // LiDAR binary format detected by: bytes 0-1 = u16(2), bytes 2-3 = u16(0).
         // deal_array_buffer_for_lidar(&buffer[4..]) is called on the remainder.
         // The remainder needs ≥ 8 bytes (4 for json_len, 4 reserved, then JSON).
-        // With valid JSON but no "data.origin/resolution/src_size", metadata is None
-        // → inject_binary_data → Some with binary data injected.
         let json_bytes = br#"{"topic":"rt/utlidar/voxel_map_compressed"}"#;
         let json_len = json_bytes.len() as u32;
         let mut buf = Vec::new();
@@ -1713,14 +2506,7 @@ mod tests {
         buf.extend_from_slice(&[0u8; 4]); // 4-byte reserved (so json_start = 8 in sub-buffer)
         buf.extend_from_slice(json_bytes);
 
-        // No metadata in JSON → inject_binary_data path → Some
-        let result = service.deal_array_buffer(&buf);
-        assert!(
-            result.is_some(),
-            "lidar tag without metadata goes through inject_binary_data and returns Some"
-        );
-        let parsed = result.unwrap();
-        assert_eq!(parsed["topic"], "rt/utlidar/voxel_map_compressed");
+        assert!(service.deal_array_buffer(&buf).is_none());
     }
 
     // ── validation flow ───────────────────────────────────────────────────────
@@ -1776,6 +2562,7 @@ mod tests {
             service.pending_callbacks.lock().unwrap().insert(
                 key,
                 PendingCallback {
+                    token: Arc::new(()),
                     sender: sx,
                     expectation: ResponseExpectation::any(),
                     session_id: service.session_id.load(Ordering::Relaxed),
@@ -1844,7 +2631,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         assert!(
-            cb_rx.is_empty(),
+            cb_rx.try_recv().is_err(),
             "no callback should fire after unsubscribe"
         );
     }

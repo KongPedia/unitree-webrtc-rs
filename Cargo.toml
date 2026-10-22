@@ -1,6 +1,6 @@
 [package]
 name = "unitree-webrtc-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["jongmoon-konglabs"]
 description = "Rust-owned WebRTC transport for Unitree Go2 robots"
@@ -11,8 +11,9 @@ name = "unitree_webrtc_rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
-extension-module = ["pyo3/extension-module"]
+default = ["python"]
+python = ["dep:numpy", "dep:pyo3", "dep:pyo3-async-runtimes", "dep:pyo3-build-config"]
+extension-module = ["python", "pyo3/extension-module"]
 jetson = []
 
 [dependencies]
@@ -25,9 +26,9 @@ crossbeam-channel = "0.5.14"
 hex = "0.4.3"
 lz4_flex = "0.11"
 md-5 = "0.10.6"
-numpy = "0.28"
-pyo3 = { version = "0.28", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
+numpy = { version = "0.28", optional = true }
+pyo3 = { version = "0.28", optional = true }
+pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"], optional = true }
 rand = "0.10.0"
 reqwest = { version = "0.13.2", features = ["json", "stream"] }
 rsa = "0.9.10"
@@ -48,7 +49,7 @@ gstreamer-audio = "0.25.0"
 
 
 [build-dependencies]
-pyo3-build-config = "0.28"
+pyo3-build-config = { version = "0.28", features = ["resolve-config"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,14 +1,15 @@
 use crossbeam_channel::bounded;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use unitree_webrtc_rs::connection::ConnectionService;
 use unitree_webrtc_rs::datachannel::core::DataChannelService;
 use unitree_webrtc_rs::datachannel::lidar;
-use unitree_webrtc_rs::protocol::constants::WebRTCConnectionMethod;
-use unitree_webrtc_rs::protocol::models::{CallbackEvent, DcMessage};
+use unitree_webrtc_rs::protocol::constants::{rtc_topic, sport_cmd, WebRTCConnectionMethod};
+use unitree_webrtc_rs::protocol::events::{event_channel, EventReceiver};
+use unitree_webrtc_rs::protocol::models::{CallbackEvent, DcMessage, IngressMessage};
 use unitree_webrtc_rs::protocol::ports::{
     DataChannelPort, PortResult, RtcEnginePort, SignalingPort,
 };
@@ -21,8 +22,10 @@ struct MockEnvironment {
     engine_applied: Arc<AtomicBool>,
     engine_closed: Arc<AtomicBool>,
     dc_ready_state: &'static str,
+    generation: AtomicU64,
+    respond_to_requests: AtomicBool,
     dc_sent_messages: Arc<std::sync::Mutex<Vec<String>>>,
-    dc_sender: std::sync::Mutex<Option<crossbeam_channel::Sender<DcMessage>>>,
+    dc_sender: std::sync::Mutex<Option<crossbeam_channel::Sender<IngressMessage>>>,
 }
 
 impl MockEnvironment {
@@ -33,14 +36,36 @@ impl MockEnvironment {
             engine_applied: Arc::new(AtomicBool::new(false)),
             engine_closed: Arc::new(AtomicBool::new(false)),
             dc_ready_state: ready_state,
+            generation: AtomicU64::new(0),
+            respond_to_requests: AtomicBool::new(false),
             dc_sent_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
             dc_sender: std::sync::Mutex::new(None),
         }
     }
 
+    fn sent_message(&self, message_type: &str, topic: &str) -> Value {
+        self.dc_sent_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|message| serde_json::from_str::<Value>(message).unwrap())
+            .find(|message| message["type"] == message_type && message["topic"] == topic)
+            .expect("Expected matching outbound envelope")
+    }
+
+    fn interleave_heartbeat(&self) {
+        // A background frame must not change which application envelope is asserted.
+        self.send_text(r#"{"type":"heartbeat","topic":"","data":{"time":1}}"#)
+            .unwrap();
+    }
+
     fn push_incoming_message(&self, message: &str) {
         if let Some(sender) = self.dc_sender.lock().unwrap().as_ref() {
-            let _ = sender.send(DcMessage::Text(message.to_string()));
+            let _ = sender.send(
+                DcMessage::Text(message.to_string())
+                    .for_generation(self.generation.load(Ordering::SeqCst)),
+            );
         }
     }
 }
@@ -84,6 +109,24 @@ impl DataChannelPort for MockEnvironment {
             .lock()
             .unwrap()
             .push(message.to_string());
+        let envelope: Value = serde_json::from_str(message).unwrap();
+        if envelope["type"] == "req" && self.respond_to_requests.load(Ordering::Relaxed) {
+            self.interleave_heartbeat();
+            self.push_incoming_message(
+                &json!({
+                    "type": "res",
+                    "topic": "rt/api/sport/response",
+                    "data": {
+                        "header": {
+                            "identity": envelope["data"]["header"]["identity"],
+                            "status": {"code": 0}
+                        },
+                        "data": "mock_state"
+                    }
+                })
+                .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -91,8 +134,16 @@ impl DataChannelPort for MockEnvironment {
         Ok(())
     }
 
-    fn set_message_sender(&self, sender: crossbeam_channel::Sender<DcMessage>) -> PortResult<()> {
+    fn set_message_sender(
+        &self,
+        sender: crossbeam_channel::Sender<IngressMessage>,
+    ) -> PortResult<()> {
         *self.dc_sender.lock().unwrap() = Some(sender);
+        Ok(())
+    }
+
+    fn set_ingress_generation(&self, generation: u64) -> PortResult<()> {
+        self.generation.store(generation, Ordering::SeqCst);
         Ok(())
     }
 
@@ -107,11 +158,11 @@ async fn setup_test_environment() -> (
     Arc<ConnectionService<MockEnvironment, MockEnvironment>>,
     Arc<DataChannelService<MockEnvironment>>,
     Arc<MockEnvironment>,
-    crossbeam_channel::Receiver<CallbackEvent>,
+    EventReceiver,
 ) {
     let mock_env = Arc::new(MockEnvironment::new("open")); // Assuming "open" for tests
-    let (incoming_tx, incoming_rx) = bounded::<DcMessage>(100);
-    let (callback_tx, callback_rx) = bounded::<CallbackEvent>(100);
+    let (incoming_tx, incoming_rx) = bounded::<IngressMessage>(100);
+    let (callback_tx, callback_rx) = event_channel(100).unwrap();
 
     // MockEnvironment captures the incoming sender to simulate WebRTC returning data
     mock_env.set_message_sender(incoming_tx).unwrap();
@@ -150,40 +201,22 @@ async fn test_sport_mode_example_flow() {
     let dc_wait: PortResult<()> = dc.wait_datachannel_open(1.0).await;
     assert!(dc_wait.is_ok(), "Datachannel should open successfully");
 
-    // 3. Publish Sport Mode Command (Mimic `sport_mode.py`)
-    let request_payload = json!({
-        "api_id": 1034, // SPORT_CMD GetState
-        "id": 1
-    });
+    // Reply only after observing the request, without relying on scheduler timing.
+    env.respond_to_requests.store(true, Ordering::Relaxed);
+    let topic = rtc_topic()["SPORT_MOD"];
+    let api_id = sport_cmd()["GetState"];
+    let response = dc
+        .publish_request_new(topic, json!({"api_id": api_id, "id": 1}), Some(2.0))
+        .await
+        .expect("Matching sport response should complete the request");
+    assert_eq!(response["data"]["header"]["status"]["code"], 0);
+    assert_eq!(response["data"]["data"], "mock_state");
 
-    // We simulate the response arriving while publish_request_new is awaiting
-    tokio::spawn({
-        let env_clone = env.clone();
-        async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            env_clone.push_incoming_message(
-                r#"{
-                "type": "res",
-                "topic": "rt/api/sport/request",
-                "data": {"header": {"identity": {"id": 1, "api_id": 1034}}, "parameter": "mock_state"}
-            }"#,
-            );
-        }
-    });
-
-    let pub_res: PortResult<serde_json::Value> = dc
-        .publish_request_new("rt/api/sport/request", request_payload, Some(2.0))
-        .await;
-    assert!(
-        pub_res.is_ok(),
-        "Publish request should complete successfully"
-    );
-
-    // Check what was actually sent down the DataChannel
-    let sent = env.dc_sent_messages.lock().unwrap();
-    let last_sent = sent.last().expect("Should have sent a request");
-    assert!(last_sent.contains("rt/api/sport/request"));
-    assert!(last_sent.contains(r#""api_id":1034"#));
+    env.interleave_heartbeat();
+    let request = env.sent_message("req", topic);
+    assert_eq!(request["data"]["header"]["identity"]["api_id"], api_id);
+    assert_eq!(request["data"]["header"]["identity"]["id"], 1);
+    assert_eq!(request["data"]["parameter"], "");
 }
 
 #[tokio::test]
@@ -194,24 +227,16 @@ async fn test_sport_mode_state_subscription_flow() {
     conn.connect().await.unwrap();
 
     // 2. Subscribe to LF_SPORT_MOD_STATE (Mimic `sport_mode_state.py`)
-    let sub_res = dc.subscribe("rt/lf/sportmod/state");
+    let topic = rtc_topic()["LF_SPORT_MOD_STATE"];
+    let sub_res = dc.subscribe(topic);
     assert!(sub_res.is_ok());
 
-    // Verify subscription message was sent
-    {
-        let sent = env.dc_sent_messages.lock().unwrap();
-        let last_sent = sent.last().expect("Should have sent subscribe");
-        assert!(last_sent.contains("rt/lf/sportmod/state"));
-        assert!(last_sent.contains(r#""type":"subscribe""#));
-    }
+    env.interleave_heartbeat();
+    let subscription = env.sent_message("subscribe", topic);
+    assert_eq!(subscription["topic"], topic);
 
-    // 3. Simulate incoming message for that topic from robot
     env.push_incoming_message(
-        r#"{
-        "type": "msg",
-        "topic": "rt/lf/sportmod/state",
-        "data": {"mode": "standing"}
-    }"#,
+        &json!({"type": "msg", "topic": topic, "data": {"mode": "standing"}}).to_string(),
     );
 
     // 4. Verify message is routed to Python's callback channel
@@ -220,7 +245,7 @@ async fn test_sport_mode_state_subscription_flow() {
 
     match evt.unwrap() {
         CallbackEvent::TopicCallback { topic, payload } => {
-            assert_eq!(topic, "rt/lf/sportmod/state");
+            assert_eq!(topic, rtc_topic()["LF_SPORT_MOD_STATE"]);
             assert_eq!(payload["data"]["mode"], "standing");
         }
         _ => panic!("Expected TopicCallback"),
@@ -238,25 +263,17 @@ async fn test_video_stream_flow() {
     let switch_res = dc.switch_video_channel(true);
     assert!(switch_res.is_ok());
 
-    // Verify correct data sent
-    {
-        let sent = env.dc_sent_messages.lock().unwrap();
-        let last_sent = sent.last().expect("Should have sent video switch");
-        assert!(last_sent.contains(r#""type":"vid""#));
-        assert!(last_sent.contains(r#""data":"on""#));
-    }
+    env.interleave_heartbeat();
+    let video_on = env.sent_message("vid", "");
+    assert_eq!(video_on["data"], "on");
 
     // Disable Video Channel
     let switch_off_res = dc.switch_video_channel(false);
     assert!(switch_off_res.is_ok());
 
-    // Verify correct data sent
-    {
-        let sent = env.dc_sent_messages.lock().unwrap();
-        let last_sent = sent.last().expect("Should have sent video switch");
-        assert!(last_sent.contains(r#""type":"vid""#));
-        assert!(last_sent.contains(r#""data":"off""#));
-    }
+    env.interleave_heartbeat();
+    let video_off = env.sent_message("vid", "");
+    assert_eq!(video_off["data"], "off");
 
     // 3. Disconnect
     conn.disconnect().await;

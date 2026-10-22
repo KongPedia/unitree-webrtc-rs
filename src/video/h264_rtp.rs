@@ -1,6 +1,8 @@
 /// Simple H264 RTP depacketizer for FU-A fragmentation
 /// Ref: RFC 6184
 const FU_A_TYPE: u8 = 28;
+// Resource policy: cap one pending NAL; this is not a robot/codec maximum.
+const MAX_NAL_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct H264RtpReassembler {
     buffer: Vec<u8>,
@@ -21,45 +23,55 @@ impl H264RtpReassembler {
         }
     }
 
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.in_progress = false;
+    }
+
     pub fn process_packet(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
-        if payload.is_empty() {
+        if payload.is_empty() || payload.len() > MAX_NAL_BYTES || payload[0] & 0x80 != 0 {
+            self.reset();
             return None;
         }
 
-        let nal_type = payload[0] & 0x1F;
-
-        if nal_type == FU_A_TYPE {
-            if payload.len() < 2 {
-                return None;
-            }
-
-            let fu_header = payload[1];
-            let start_bit = (fu_header & 0x80) != 0;
-            let end_bit = (fu_header & 0x40) != 0;
-            let nal_unit_type = fu_header & 0x1F;
-
-            if start_bit {
-                self.buffer.clear();
-                let reconstructed_nal_header = (payload[0] & 0xE0) | nal_unit_type;
-                self.buffer.push(reconstructed_nal_header);
-                self.buffer.extend_from_slice(&payload[2..]);
-                self.in_progress = true;
-                None
-            } else if self.in_progress {
-                self.buffer.extend_from_slice(&payload[2..]);
-
-                if end_bit {
-                    self.in_progress = false;
-                    Some(self.buffer.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            Some(payload.to_vec())
+        let nal_type = payload[0] & 0x1f;
+        if nal_type != FU_A_TYPE {
+            self.reset();
+            // Aggregation packets are not single NAL units; do not send them to the decoder.
+            return (1..=23).contains(&nal_type).then(|| payload.to_vec());
         }
+        if payload.len() < 2 {
+            self.reset();
+            return None;
+        }
+
+        let fu_header = payload[1];
+        let start = fu_header & 0x80 != 0;
+        let end = fu_header & 0x40 != 0;
+        let unit_type = fu_header & 0x1f;
+        if (start && end) || fu_header & 0x20 != 0 || !(1..=23).contains(&unit_type) {
+            self.reset();
+            return None;
+        }
+        let header = (payload[0] & 0x60) | unit_type;
+        if start {
+            self.reset();
+            self.buffer.push(header);
+            self.in_progress = true;
+        } else if !self.in_progress || self.buffer.first() != Some(&header) {
+            self.reset();
+            return None;
+        }
+        if payload.len() - 2 > MAX_NAL_BYTES - self.buffer.len() {
+            self.reset();
+            return None;
+        }
+        self.buffer.extend_from_slice(&payload[2..]);
+        if !end {
+            return None;
+        }
+        self.in_progress = false;
+        Some(std::mem::take(&mut self.buffer))
     }
 }
 
@@ -136,5 +148,62 @@ mod tests {
         let short_payload = vec![FU_A_TYPE]; // Only 1 byte
         let result = reassembler.process_packet(&short_payload);
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_fragment_discards_pending_nal() {
+        let mut reassembler = H264RtpReassembler::new();
+        reassembler.process_packet(&[0x7c, 0x85, 1]);
+        assert!(reassembler.process_packet(&[0x7c]).is_none());
+        assert!(reassembler.process_packet(&[0x7c, 0x45, 2]).is_none());
+    }
+
+    #[test]
+    fn mismatched_fragment_discards_pending_nal() {
+        let mut reassembler = H264RtpReassembler::new();
+        reassembler.process_packet(&[0x7c, 0x85, 1]);
+        assert!(reassembler.process_packet(&[0x7c, 0x41, 2]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_assembly_is_discarded_and_can_restart() {
+        let mut reassembler = H264RtpReassembler::new();
+        reassembler.process_packet(&[0x7c, 0x85, 1]);
+        let mut fragment = vec![0; MAX_NAL_BYTES];
+        fragment[..2].copy_from_slice(&[0x7c, 0x05]);
+        reassembler.process_packet(&fragment);
+        assert!(reassembler.process_packet(&[0x7c, 0x45, 2]).is_none());
+        assert!(reassembler.buffer.is_empty());
+        reassembler.process_packet(&[0x7c, 0x85, 3]);
+        assert_eq!(
+            reassembler.process_packet(&[0x7c, 0x45, 4]),
+            Some(vec![0x65, 3, 4])
+        );
+    }
+
+    #[test]
+    fn interruption_and_invalid_headers_reset_assembly() {
+        for interruption in [
+            &[][..],
+            &[0x65, 3],
+            &[0x7c, 0xc5, 3],
+            &[0xfc, 0x45, 3],
+            &[0x7c, 0x65, 3],
+        ] {
+            let mut reassembler = H264RtpReassembler::new();
+            reassembler.process_packet(&[0x7c, 0x85, 1]);
+            reassembler.process_packet(interruption);
+            assert!(reassembler.process_packet(&[0x7c, 0x45, 2]).is_none());
+        }
     }
 }
