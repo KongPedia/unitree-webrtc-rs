@@ -13,7 +13,7 @@ USE CODEX NATIVE SUBAGENTS FOR INDEPENDENT PARALLEL SUBTASKS WHEN THAT IMPROVES 
 - Read `git status --short` first; preserve unrelated edits. No commit, push, publish, issue posting, deployment or robot connection/control unless authorized for that task. Examples can issue physical commands; they are not offline tests.
 - Complete clear reversible work without repeated permission handoffs. Parallelize genuinely independent bounded work when useful; give each agent ownership, evidence requirements and a no-recursive-orchestration boundary. Keep shared contracts and file edits under one integration owner.
 - Read [engineering conventions](docs/engineering/conventions.md) before application changes. Use [agent workflow and task templates](docs/engineering/agent-workflow.md) for planning/review.
-- Use the existing `wshobson/agents` skills in `.agents/skills/`: `$architecture-patterns` for responsibility/dependency boundaries, `$rust-async-patterns` for Tokio/task/channel lifetime, and `$code-review-excellence` for source-backed reviews. Consult [agent-workflow.md](docs/engineering/agent-workflow.md) for local upstream Rust/clean-refactor prompts and invocation. No custom replacement skill is required.
+- Use the existing `wshobson/agents` skills in `.agents/skills/`: `$architecture-patterns` for responsibility/dependency boundaries, `$rust-async-patterns` for Tokio/task/channel lifetime, and `$code-review-excellence` for source-backed reviews. Apply the [Rust adaptation rules](docs/engineering/conventions.md#9-rust-specific-decisions-for-coding-agents) before copying generic examples; [agent-workflow.md](docs/engineering/agent-workflow.md) maps skills to concrete Rust tasks. No custom replacement skill is required.
 
 ## Repository boundaries
 
@@ -36,7 +36,7 @@ USE CODEX NATIVE SUBAGENTS FOR INDEPENDENT PARALLEL SUBTASKS WHEN THAT IMPROVES 
 ## Verification and reporting
 
 - Application changes: inspect `Makefile`, run the smallest relevant regression first, then applicable `make check` and Rust/Python checks. `make test-rust` uses the locked Python environment and Python-linked Rust tests; extension builds alone enable `extension-module`. Report failures rather than weakening checks. Mock Python tests do not validate the native extension; add/use native offline contract coverage when changing bindings.
-- Documentation/skill-only changes: parse skill metadata, resolve local references, inspect diffs and review instruction conflicts. Do not run application tests, builds, CI, services or hardware merely to verify prose.
+- Documentation/skill-only changes: validate applicable guidance metadata/references, inspect diffs and review instruction conflicts. An ordinary prose correction does not require loading unrelated skills. Do not run application tests, builds, CI, services or hardware merely to verify prose.
 - Report changed files, exact checks/results, and unverified limits. Separate static evidence, software tests, deployed behavior and physical validation. New performance claims require reproducible workload/platform/version evidence.
 - Existing commit subjects use `[BTB-<id>] <type>. <summary>`; do not invent a ticket. When authorized to commit, explain intent, constraints and verification gaps in the body.
 

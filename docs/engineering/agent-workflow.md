@@ -29,6 +29,30 @@ These are pinned copies from [wshobson/agents](https://github.com/wshobson/agent
 
 Use only guidance relevant to the task. Invoke a skill by `$skill-name`; if another installed copy has the same name, identify the exact local `SKILL.md` path instead of loading both. The two prompt files are references, not registered Codex commands/roles; their `model: opus` metadata does not select the current Codex model. No global/plugin-cache changes are required.
 
+### Rust task routing and use cases
+
+Apply the [Rust adaptation rules](conventions.md#9-rust-specific-decisions-for-coding-agents) with the selected skill. The architecture skill's Python/DDD examples do not prescribe this crate's folders; the async skill's spawned pool-return, cancel-plus-sleep and lock slogans are not production templates. `rust-pro` is a broad reference, not a compiler/MSRV declaration or authorization for nightly features, allocators or new frameworks.
+
+| Actual request | Select and inspect | Acceptance to propose within the allowed scope |
+| --- | --- | --- |
+| Change a port or extract an independent policy | `architecture-patterns`; current architecture map, `protocol/ports.rs`, actual consumers | Dependency direction, lifetime/dispatch compatibility, fake-adapter behavior; no speculative service/trait hierarchy |
+| Fix timeout, reconnect or worker shutdown | `rust-async-patterns`; `connection/{service,lifecycle,session}.rs`, owning RTC/worker code and resource policy | Cancellation/completion owner, old-epoch isolation, overflow/fault outcome; no sleep-based success or motion replay |
+| Change a Python callback or buffer handoff | `rust-async-patterns` only if concurrency changes; conventions section 6, owning bridge/callback and root `.pyi` | Actual native dtype/shape/ownership/lifetime and callback failure behavior; no mock-only or free-threading claim |
+| Review a Rust change | `code-review-excellence`; affected code, callers and focused tests | Severity, file:line evidence, smallest causal repair and verification gap; formatting alone is not a blocker |
+| Correct prose, links or skill metadata only | Relevant document/metadata; no automatic architecture/async skill load | Guidance metadata/hash/reference and instruction-conflict checks only; no application build or robot run |
+
+For example, a bounded Rust implementation request can use the existing task brief:
+
+```text
+$rust-async-patterns
+Fix the reported stale-epoch delivery in the owning Rust module. Read the
+architecture map, Rust adaptation rules and resource policy; trace producers,
+reset and consumers first. Preserve wire fields and Python aliases. Propose the
+smallest causal repair, then implement with a meaningful offline regression.
+Use applicable Makefile checks; no robot connections, dependency upgrades or
+unrelated abstractions. Report observed checks separately from proposed checks.
+```
+
 ## Harness principles
 
 - Keep AGENTS a compact map and disclose detailed context only when relevant, following [OpenAI's harness-engineering account](https://openai.com/index/harness-engineering/).
@@ -68,5 +92,7 @@ For an implementation task, name the observed failure, permitted files/checks an
 ## Verification and updates
 
 Run `make check-guidance` for metadata, pinned hashes and local Markdown references. Inspect the diff and instruction conflicts separately. This validates files, not live UI discovery, automatic skill selection or model compliance. A fresh session may be needed to observe changed instruction/skill discovery; verify that in the actual host rather than claiming it from hashes.
+
+For a substantive guidance change, try a bounded task from the use-case table with an independent agent and raw source context, without supplying the expected answer. Include a neighboring negative case such as a prose-only correction. Evaluate selected guidance, source-backed decisions, preserved contracts and execution scope—not echoed headings or claimed compliance. Keep observations in the task/PR, not another permanent dated report. [OpenAI's skill-evaluation example](https://developers.openai.com/blog/eval-skills) motivates this distinction; one explicit-invocation rehearsal does not prove automatic discovery or universal adherence.
 
 For a deliberate upstream upgrade, compare a reviewed pinned revision in a temporary destination, replace only the owned source/reference/prompt copies, refresh manifest hashes/license and rerun guidance checks. Do not track `main` automatically or edit marketplace caches. Keep application tests/builds and hardware checks out of prose-only verification.
