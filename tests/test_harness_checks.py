@@ -234,3 +234,67 @@ def test_wheel_smoke_uses_project_interpreter_via_uv(tmp_path, monkeypatch):
         assert kwargs["env"]["UV_OFFLINE"] == "1"
         assert "PYTHONHOME" not in kwargs["env"]
         assert "PYTHONPATH" not in kwargs["env"]
+
+
+def test_make_invalidates_pyo3_config_when_python_changes_at_same_path(tmp_path):
+    import os
+
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, sysconfig\n"
+        "sys.version = os.environ['HARNESS_PYTHON_VERSION']\n"
+        "sysconfig.get_config_var = lambda name: os.environ['HARNESS_PYTHON_ABI']\n"
+        "exec(sys.argv[-1])\n"
+    )
+    fake_uv.chmod(0o755)
+    probe = tmp_path / "probe.mk"
+    probe.write_text(
+        'print-python-signature:;@printf "%s\\n" "$$PYO3_ENVIRONMENT_SIGNATURE"\n'
+    )
+    signatures = []
+    for version, abi in (("3.10.19", "cpython-310"), ("3.12.15", "cpython-312")):
+        result = subprocess.run(
+            [
+                "make",
+                "--no-print-directory",
+                "-f",
+                "Makefile",
+                "-f",
+                str(probe),
+                "print-python-signature",
+            ],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "PATH": f"{tmp_path}:{os.environ['PATH']}",
+                "HARNESS_PYTHON_VERSION": version,
+                "HARNESS_PYTHON_ABI": abi,
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        signatures.append(result.stdout.strip())
+    assert all(signatures)
+    assert signatures[0] != signatures[1]
+
+
+def test_release_target_cache_isolated_by_python_arch_and_rust():
+    workflow = (ROOT / ".github/workflows/publish-pypi.yml").read_text()
+    target_cache = workflow.split("- name: Cache Rust build outputs", 1)[1].split(
+        "- name:", 1
+    )[0]
+    boundary = (
+        "${{ runner.os }}-${{ runner.arch }}-target-v2-"
+        "${{ steps.build-cache.outputs.python }}-"
+        "${{ steps.build-cache.outputs.rust }}-"
+    )
+    assert f"key: {boundary}${{{{ hashFiles('**/Cargo.lock') }}}}" in target_cache
+    assert f"restore-keys: |\n            {boundary}\n" in target_cache
+    assert "path: target" in target_cache
+    assert workflow.index("uv sync --locked") < workflow.index("id: build-cache")
+    identity_step = workflow.split("id: build-cache", 1)[1].split("- name:", 1)[0]
+    assert 'sysconfig.get_config_var("SOABI")' in identity_step
+    assert "platform.python_version()" in identity_step
+    assert "rustc -vV" in identity_step
