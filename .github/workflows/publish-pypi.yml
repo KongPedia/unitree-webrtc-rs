@@ -61,19 +61,32 @@ jobs:
             gst-inspect-1.0 --exists "$element"
           done
 
+      - name: Sync uv dependencies
+        run: uv sync --locked --dev --no-install-project --python "${{ matrix.python-version }}"
+
+      - name: Identify Python ABI and Rust toolchain for build cache
+        id: build-cache
+        run: |
+          uv run --locked --no-sync python -c 'import platform, sysconfig; print("python=" + platform.python_version() + "-" + sysconfig.get_config_var("SOABI"))' >> "$GITHUB_OUTPUT"
+          echo "rust=$(rustc -vV | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
       - name: Cache Rust dependencies
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-downloads-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-downloads-v2-
 
-      - name: Sync uv dependencies
-        run: uv sync --locked --dev --no-install-project --python "${{ matrix.python-version }}"
+      - name: Cache Rust build outputs
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ runner.arch }}-target-v2-${{ steps.build-cache.outputs.python }}-${{ steps.build-cache.outputs.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-target-v2-${{ steps.build-cache.outputs.python }}-${{ steps.build-cache.outputs.rust }}-
 
       - name: Offline acceptance (Rust, core and freshly built native Python)
         run: make acceptance

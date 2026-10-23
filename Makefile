@@ -4,6 +4,8 @@
 .NOTPARALLEL:
 UV = uv run --locked --no-sync
 export PYO3_PYTHON = $(shell $(UV) python -c 'import sys; print(sys.executable)')
+# A venv path can stay unchanged when its underlying Python/ABI is replaced.
+export PYO3_ENVIRONMENT_SIGNATURE = $(shell $(UV) python -c 'import hashlib, sys, sysconfig; print(hashlib.sha256(repr((sys.executable, sys.base_prefix, sys.version, sysconfig.get_config_var("SOABI"))).encode()).hexdigest())')
 
 help:
 	@echo "Targets:"
