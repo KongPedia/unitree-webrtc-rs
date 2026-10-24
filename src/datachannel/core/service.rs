@@ -13,7 +13,7 @@ use crate::protocol::models::{CallbackEvent, DcMessage, IngressMessage, RequestI
 use crate::protocol::ports::{DataChannelPort, PortResult};
 use bytes::Bytes;
 use chrono::Local;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -220,6 +220,7 @@ where
     data_channel_opened: Arc<AtomicBool>,
     heartbeat_last_response: Arc<AtomicU64>,
     heartbeat_running: Arc<AtomicBool>,
+    heartbeat_stop_tx: Arc<Mutex<Option<Sender<()>>>>,
     network_probe_running: Arc<AtomicBool>,
     throttle_limits: Arc<HashMap<String, f64>>,
     last_process_time: Arc<Mutex<HashMap<String, f64>>>,
@@ -249,6 +250,7 @@ where
             data_channel_opened: Arc::clone(&self.data_channel_opened),
             heartbeat_last_response: Arc::clone(&self.heartbeat_last_response),
             heartbeat_running: Arc::clone(&self.heartbeat_running),
+            heartbeat_stop_tx: Arc::clone(&self.heartbeat_stop_tx),
             network_probe_running: Arc::clone(&self.network_probe_running),
             throttle_limits: Arc::clone(&self.throttle_limits),
             last_process_time: Arc::clone(&self.last_process_time),
@@ -342,6 +344,7 @@ where
             data_channel_opened: Arc::new(AtomicBool::new(false)),
             heartbeat_last_response: Arc::new(AtomicU64::new(0)),
             heartbeat_running: Arc::new(AtomicBool::new(false)),
+            heartbeat_stop_tx: Arc::new(Mutex::new(None)),
             network_probe_running: Arc::new(AtomicBool::new(false)),
             throttle_limits: Arc::new(throttle_limits),
             last_process_time: Arc::new(Mutex::new(HashMap::new())),
@@ -629,8 +632,14 @@ where
         true
     }
 
-    pub fn stop_background_tasks(&self) {
+    fn stop_heartbeat(&self) {
         self.heartbeat_running.store(false, Ordering::Relaxed);
+        // Disconnect persists even when the heartbeat has not entered its wait yet.
+        self.heartbeat_stop_tx.lock().unwrap().take();
+    }
+
+    pub fn stop_background_tasks(&self) {
+        self.stop_heartbeat();
         self.network_probe_running.store(false, Ordering::Relaxed);
         self.data_channel_opened.store(false, Ordering::Relaxed);
         self.start_new_session();
@@ -649,7 +658,7 @@ where
                 "Transport cannot prepare a new ingress session"
             );
         }
-        self.heartbeat_running.store(false, Ordering::Relaxed);
+        self.stop_heartbeat();
         self.network_probe_running.store(false, Ordering::Relaxed);
         self.data_channel_opened.store(false, Ordering::Relaxed);
         self.heartbeat_last_response.store(0, Ordering::Relaxed);
@@ -719,7 +728,7 @@ where
                     self.diagnostics.control_send.record();
                 }
                 self.data_channel_opened.store(false, Ordering::Relaxed);
-                self.heartbeat_running.store(false, Ordering::Relaxed);
+                self.stop_heartbeat();
                 self.network_probe_running.store(false, Ordering::Relaxed);
                 self.chunk_data_storage.lock().unwrap().clear();
                 self.fail_all_pending(&error);
@@ -1151,6 +1160,8 @@ where
             return;
         }
 
+        let (stop_tx, stop_rx) = bounded(0);
+        *self.heartbeat_stop_tx.lock().unwrap() = Some(stop_tx);
         let epoch = self.session_id.load(Ordering::SeqCst);
         let owner = self.owner_lifetime.clone();
         let mut service = self.clone();
@@ -1174,7 +1185,7 @@ where
                             elapsed_sec = now.saturating_sub(last),
                             "Heartbeat timeout detected"
                         );
-                        service.heartbeat_running.store(false, Ordering::Relaxed);
+                        service.stop_heartbeat();
                         service.data_channel_opened.store(false, Ordering::Relaxed);
                         service.fail_all_pending("Heartbeat timeout");
                         service.chunk_data_storage.lock().unwrap().clear();
@@ -1191,7 +1202,11 @@ where
                     }
 
                     drop(lifecycle);
-                    thread::sleep(Duration::from_secs(2));
+                    if stop_rx.recv_timeout(Duration::from_secs(2))
+                        != Err(RecvTimeoutError::Timeout)
+                    {
+                        break;
+                    }
                 }
             })
             .expect("failed to spawn heartbeat thread");
@@ -1807,6 +1822,165 @@ mod tests {
             weak.upgrade().is_none(),
             "router must not own the service lifetime"
         );
+    }
+
+    #[test]
+    fn heartbeat_stop_releases_producers_before_next_tick() {
+        let (service, channel, _ingress, events) = make_service("open");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        release.wait();
+        // Stop takes the lifecycle lock after the admitted first heartbeat send.
+        service.stop_background_tasks();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "stopped heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    #[test]
+    fn heartbeat_stop_before_wait_releases_producers_before_next_tick() {
+        let (service, channel, _ingress, events) = make_service("open");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        let stopping = service.clone();
+        let stop = thread::spawn(move || stopping.stop_background_tasks());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        // Hold the first send until cancellation, so the worker cannot have parked yet.
+        while service.heartbeat_stop_tx.lock().unwrap().is_some()
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        let cancelled_before_wait = service.heartbeat_stop_tx.lock().unwrap().is_none();
+        release.wait();
+        stop.join().unwrap();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            cancelled_before_wait,
+            "stop waited for the next heartbeat tick"
+        );
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "cancellation before parking failed to release heartbeat producers"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    #[test]
+    fn heartbeat_final_owner_drop_releases_producers_before_next_tick() {
+        let (service, channel, _ingress, events) = make_service("open");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        release.wait();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "orphaned heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    fn heartbeat_without_router() -> (
+        DataChannelService<MockDataChannel>,
+        Arc<MockDataChannel>,
+        EventReceiver,
+    ) {
+        let (_ingress, incoming) = bounded(1);
+        let (events_tx, events) = event_channel(1).unwrap();
+        let pool = Arc::new(LidarWorkerPool::new(events_tx.clone(), 1));
+        let channel = Arc::new(MockDataChannel {
+            state: "open",
+            ..MockDataChannel::default()
+        });
+        let service = DataChannelService::try_new_with_spawner(
+            channel.clone(),
+            incoming,
+            events_tx,
+            pool,
+            false,
+            &mut |builder, router| {
+                // Stub routing only: its final stop must not mask a missing heartbeat wake.
+                drop(router);
+                builder.spawn(|| {})
+            },
+        )
+        .unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        release.wait();
+        (service, channel, events)
+    }
+
+    #[test]
+    fn heartbeat_reset_releases_producers_before_next_tick() {
+        let (service, channel, events) = heartbeat_without_router();
+        service.start_new_session();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "reset heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    #[test]
+    fn heartbeat_transport_fault_releases_producers_before_next_tick() {
+        let (service, channel, events) = heartbeat_without_router();
+        let generation = service.session_id.load(Ordering::SeqCst);
+        service.process_ingress(
+            DcMessage::TransportFault("fixture send failure".into()).for_generation(generation),
+        );
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "faulted heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
     }
 
     #[test]
