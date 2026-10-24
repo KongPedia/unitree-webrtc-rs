@@ -48,6 +48,170 @@
       "local": "docs/engineering/upstream-license.txt",
       "source": "LICENSE",
       "sha256": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746"
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/SKILL.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/SKILL.md",
+      "upstream_sha256": "b1651a95a2c36a8350c033449f52d07eebfdbf08e3bd1d5b22c4b7f55f7aa17c",
+      "sha256": "5857372aefe51aa520b77cb0d16ad02a898a8f7ed6f2f614d6fbadd3d76a4106",
+      "modifications": "Preserve original skill name; replace multiline metadata with the two plain single-line fields accepted by the existing repository checker and remove allowed-tools/version/compatibility metadata. Add a modification notice linking canonical Rust adaptation rules and pinned Google text references/licenses; no runtime permissions or commands are installed. Link both canonical Rust rules and explicit external-guide applicability limits before upstream advice."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_01.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_01.md",
+      "upstream_sha256": "def0d5dc6ad2c8e143aed03c888c3f55b7f2b8f245c563e970f8fa951f7d7b52",
+      "sha256": "ffefea1dd08289d63036f3e587edca311e067cdea9776ec3557a80bfbbd0063b",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_02.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_02.md",
+      "upstream_sha256": "3b5d4ad26ce444770a05d91f737cc48417cb5bac94b2ab1587fc8de536bdcbb9",
+      "sha256": "d139267423bc30d8a1b20815c5ae4468ec9290f99283e1d10f7ce40c1b6d5093",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_03.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_03.md",
+      "upstream_sha256": "fd673405cc1b5094d44d59eac4634e35525d7103d34b43178ee37277f392e15f",
+      "sha256": "5a575bb71809e110e511500e474175c60b8c088d951416624d6e0f474b71cd0f",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_04.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_04.md",
+      "upstream_sha256": "5189a1118c41c25426357a14ad4e651e931443f1aefc241ea79689cb694175bf",
+      "sha256": "d1400798e15e25fd55f102d55e10c2b7935a0a851404f140e578102a578d9b88",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_05.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_05.md",
+      "upstream_sha256": "fb753a7515e11c1bc84d853d8b6d3442dd810d607f2b153595248d57232b8d38",
+      "sha256": "117b432d821efd40fd251167f83b0deef5b1cde462d239617ac53b3e29464dfd",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_06.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_06.md",
+      "upstream_sha256": "cff0a6826a23a9c4337700757cc67f4741aa4be81cd56925601b110752d38534",
+      "sha256": "00c9249914e6951723c5f02a088c31ec3734da9f6fd4862631581a6683241dc6",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_07.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_07.md",
+      "upstream_sha256": "be71105ee9123fe2dff6673d85fc854eafd281fbfa6e8778216d3f3a8d0ffaad",
+      "sha256": "e75deaa4fd0e85fa8631fc1f530cdefca7df2af8193764a3759a8ced427386b2",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_08.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_08.md",
+      "upstream_sha256": "54c1548a28586ebb373fe508ce0d885d78bc83e579aabd89836d2a53f7129a8b",
+      "sha256": "847f98424297eee067aaf7634e17b55336f227783c41d28629a15bb039448e28",
+      "modifications": "Normalize trailing whitespace and terminal newline only for repository text/whitespace checks; retain substantive handbook text, examples and fenced illustrative ADR placeholders."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/chapter_09.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "skills/rust-best-practices/references/chapter_09.md",
+      "upstream_sha256": "bdd59af111d402e4385c77e26fa6d53fc113e40ef678a9cf7aaff221e5c21917",
+      "sha256": "79ca017a7c29a97bc4a765cdbb90bc95bf4444e676a1672fa77230f52fe80344",
+      "modifications": "Normalize trailing whitespace/final newline; correct conditional Send/Sync reference/container bounds against Rust 1.92 standard-library sources, remove oversimplified initialization-type rows, and clarify shared-reference interior mutability, non-Copy Cell operations and raw-pointer creation versus unsafe access. Add a prominent modification notice and primary-source links; preserve other handbook examples."
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/apollo-LICENSE.md",
+      "source_id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "source": "LICENSE",
+      "upstream_sha256": "37fe5c19dc6b3904a11dc50b4ac4a2463625ace4d2aa3b8c417c58bd58cfb361",
+      "sha256": "37fe5c19dc6b3904a11dc50b4ac4a2463625ace4d2aa3b8c417c58bd58cfb361",
+      "modifications": ""
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/google-rust-style-guide.md",
+      "source_id": "google-rust-styleguide",
+      "repository": "https://github.com/google/styleguide",
+      "revision": "ac81bb465fdc5f0f68f64b72a90024c7c52442cc",
+      "source": "rustguide.md",
+      "upstream_sha256": "3fe2ecf2480a594396f2c7635a9cdaaf30a01c753b47b010e05cfe2ea92987f3",
+      "sha256": "3fe2ecf2480a594396f2c7635a9cdaaf30a01c753b47b010e05cfe2ea92987f3",
+      "modifications": ""
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/google-styleguide-LICENSE.md",
+      "source_id": "google-rust-styleguide",
+      "repository": "https://github.com/google/styleguide",
+      "revision": "ac81bb465fdc5f0f68f64b72a90024c7c52442cc",
+      "source": "LICENSE",
+      "upstream_sha256": "e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76",
+      "sha256": "e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76",
+      "modifications": ""
+    },
+    {
+      "local": ".agents/skills/rust-best-practices/references/google-styleguide-licensing.md",
+      "source_id": "google-rust-styleguide",
+      "repository": "https://github.com/google/styleguide",
+      "revision": "ac81bb465fdc5f0f68f64b72a90024c7c52442cc",
+      "source": "README.md",
+      "upstream_sha256": "1caced48cf6d3fec01ec04048efee99d96e1bfc21b2cecb7225bd8404c9faff1",
+      "sha256": "775a3f7231221ec544713622fdbb74ac8150eed763dc77b7a81a22d246024d33",
+      "modifications": "Retain the original Licensing section verbatim, excluding its external badge and unrelated README sections; add Google/title attribution, immutable original guide/declaration links, local license link and explicit extraction/modification notice. Preserve the prose CC-BY-3.0/code-sample Apache-2.0 distinction and both official license URLs."
+    }
+  ],
+  "source_resolution": "Rows without source_id use the existing top-level repository/revision; source_id rows resolve sources and must match any per-row repository/revision.",
+  "sources": [
+    {
+      "id": "apollo-rust-best-practices",
+      "repository": "https://github.com/apollographql/skills",
+      "revision": "f9843dce86b1a561e3bfbb024e65c28a6cbbe38c",
+      "license": ".agents/skills/rust-best-practices/references/apollo-LICENSE.md",
+      "skills": [
+        "rust-best-practices"
+      ],
+      "resource_scope": "Selected rust-best-practices entrypoint and all nine text reference chapters; excludes marketplace/plugin configuration and other Apollo skills."
+    },
+    {
+      "id": "google-rust-styleguide",
+      "repository": "https://github.com/google/styleguide",
+      "revision": "ac81bb465fdc5f0f68f64b72a90024c7c52442cc",
+      "license": ".agents/skills/rust-best-practices/references/google-styleguide-LICENSE.md",
+      "skills": [
+        "rust-best-practices"
+      ],
+      "license_note": "Google README Licensing identifies prose as CC-BY-3.0 and code samples as Apache-2.0; faithful licensing excerpt, attribution and original license URLs are preserved locally.",
+      "resource_scope": "Unmodified rustguide.md and CC-BY-3.0 LICENSE plus adapted README Licensing excerpt with attribution and immutable source links; excludes unrelated Google guides and Google-specific build tooling."
     }
   ]
 }
