@@ -1,3 +1,4 @@
+use crate::protocol::ingress::{parse_json, MAX_BINARY_HEADER_BYTES};
 use serde_json::Value;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,14 +31,16 @@ pub(super) fn parse(buffer: &[u8]) -> Result<(BinaryFrame, Value, &[u8]), String
             )
         }
     };
+    if length > MAX_BINARY_HEADER_BYTES {
+        return Err("Binary JSON header exceeds 64 KiB".into());
+    }
     let end = start
         .checked_add(length)
         .ok_or("Binary frame length overflow")?;
     let json = buffer
         .get(start..end)
         .ok_or("Binary JSON header exceeds frame length")?;
-    let header: Value = serde_json::from_slice(json)
-        .map_err(|error| format!("Invalid {frame:?} binary JSON header: {error}"))?;
+    let header = parse_json(json).map_err(str::to_owned)?;
     if !header.is_object() {
         return Err(format!("{frame:?} binary JSON header must be an object"));
     }
@@ -47,6 +50,35 @@ pub(super) fn parse(buffer: &[u8]) -> Result<(BinaryFrame, Value, &[u8]), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_binary_header_byte_limit_preserves_lidar_payload() {
+        let mut header = br#"{"type":"msg","topic":"lidar"}"#.to_vec();
+        header.resize(64 * 1024, b' ');
+        let mut frame = vec![2, 0, 0, 0];
+        frame.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&[0; 4]);
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&[7, 8, 9]);
+        let (kind, parsed, payload) = parse(&frame).unwrap();
+        assert_eq!(kind, BinaryFrame::Lidar);
+        assert_eq!(parsed["topic"], "lidar");
+        assert_eq!(payload, [7, 8, 9]);
+        frame[4..8].copy_from_slice(&(64u32 * 1024 + 1).to_le_bytes());
+        assert_eq!(
+            parse(&frame).unwrap_err(),
+            "Binary JSON header exceeds 64 KiB"
+        );
+    }
+
+    #[test]
+    fn boundary_binary_headers_share_preallocation_json_depth_policy() {
+        let header = format!("{{\"data\":{}null{}}}", "[".repeat(64), "]".repeat(64));
+        let mut frame = (header.len() as u16).to_le_bytes().to_vec();
+        frame.extend_from_slice(&[1, 0]);
+        frame.extend_from_slice(header.as_bytes());
+        assert!(parse(&frame).is_err());
+    }
 
     #[test]
     fn framing_rejects_truncation_and_invalid_json() {

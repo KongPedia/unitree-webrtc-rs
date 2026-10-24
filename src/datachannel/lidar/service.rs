@@ -55,17 +55,52 @@ pub struct LidarWorkerPool {
 }
 
 impl LidarWorkerPool {
+    /// Legacy constructor; prefer `try_new` for recoverable startup errors.
+    ///
+    /// # Panics
+    /// Panics when worker count is invalid or a worker thread cannot start.
     pub fn new(callback_events_tx: EventSender, worker_count: usize) -> Self {
+        Self::try_new(callback_events_tx, worker_count)
+            .expect("failed to spawn lidar worker thread")
+    }
+
+    /// Start 1–32 workers, returning an error after idle startup workers finish on failure.
+    /// Normal pool drop remains nonblocking; the last sender disconnects the workers.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid worker count or OS thread creation failure.
+    pub fn try_new(callback_events_tx: EventSender, worker_count: usize) -> Result<Self, String> {
+        Self::try_new_with_spawner(callback_events_tx, worker_count, &mut |builder, job| {
+            builder.spawn(job)
+        })
+        .map(|(pool, _workers)| pool)
+    }
+
+    pub(crate) fn try_new_with_spawner<F>(
+        callback_events_tx: EventSender,
+        worker_count: usize,
+        spawn: &mut F,
+    ) -> Result<(Self, Vec<thread::JoinHandle<()>>), String>
+    where
+        F: FnMut(
+            thread::Builder,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<thread::JoinHandle<()>>,
+    {
+        if !(1..=32).contains(&worker_count) {
+            return Err("lidar_workers must be between 1 and 32".into());
+        }
         // Compressed inputs are bounded separately; do not retain a burst of 128 MiB.
         let (request_tx, request_rx) = bounded::<LidarDecodeRequest>(4);
 
+        let mut workers = Vec::with_capacity(worker_count);
         for worker_id in 0..worker_count {
             let rx = request_rx.clone();
             let callback_tx = callback_events_tx.clone();
 
-            thread::Builder::new()
-                .name(format!("unitree-lidar-worker-{worker_id}"))
-                .spawn(move || {
+            let worker = spawn(
+                thread::Builder::new().name(format!("unitree-lidar-worker-{worker_id}")),
+                Box::new(move || {
                     let dropped = RepeatLog::new("lidar_callback_drop", "stale_or_backpressure");
                     let disconnected =
                         RepeatLog::new("lidar_callback_drop", "dispatcher_disconnected");
@@ -103,11 +138,22 @@ impl LidarWorkerPool {
                             Err(_) => failed.record(),
                         }
                     }
-                })
-                .expect("failed to spawn lidar worker thread");
+                }),
+            );
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(_) => {
+                    // No pool escaped and no jobs were submitted: release and join idle startup work.
+                    drop(request_tx);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err("Failed to start LiDAR worker".into());
+                }
+            }
         }
 
-        Self { request_tx }
+        Ok((Self { request_tx }, workers))
     }
 
     pub fn submit(&self, request: LidarDecodeRequest) -> Result<(), String> {
@@ -172,6 +218,24 @@ mod tests {
     use crate::protocol::events::event_channel;
     use serde_json::json;
 
+    #[test]
+    fn construction_rejects_invalid_workers_before_spawning() {
+        for worker_count in [0, 33, usize::MAX] {
+            let (events, _) = event_channel(1).unwrap();
+            let mut attempts = 0;
+            let result =
+                LidarWorkerPool::try_new_with_spawner(events, worker_count, &mut |_, _| {
+                    attempts += 1;
+                    Err(std::io::Error::other("must never spawn"))
+                });
+            assert!(result.is_err());
+            assert_eq!(
+                attempts, 0,
+                "invalid worker count reached OS thread creation"
+            );
+        }
+    }
+
     // ── LidarMetadata ─────────────────────────────────────────────────────────
 
     /// Valid JSON with origin, resolution, src_size parses successfully.
@@ -209,7 +273,7 @@ mod tests {
     #[test]
     fn worker_pool_decodes_single_bit_to_xyz_triplet() {
         let (cb_tx, cb_rx) = event_channel(8).unwrap();
-        let pool = create_worker_pool(cb_tx);
+        let pool = LidarWorkerPool::try_new(cb_tx, 2).expect("valid fallible startup");
 
         // Use lidar_codec::bits_to_points directly to know expected output
         let mut decompressed = vec![0u8; 3];

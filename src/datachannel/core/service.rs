@@ -8,11 +8,12 @@ use crate::protocol::events::event_channel;
 #[cfg(test)]
 use crate::protocol::events::EventReceiver;
 use crate::protocol::events::EventSender;
+use crate::protocol::ingress::{parse_json, MAX_BINARY_BYTES, MAX_BINARY_EXPANSION_BYTES};
 use crate::protocol::models::{CallbackEvent, DcMessage, IngressMessage, RequestIdentity};
 use crate::protocol::ports::{DataChannelPort, PortResult};
 use bytes::Bytes;
 use chrono::Local;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -125,9 +126,7 @@ impl ResponseExpectation {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if !expected_topics.iter().any(|topic| topic == actual_topic) {
-                return Err(format!(
-                    "Response topic mismatch: expected one of {expected_topics:?}, got {actual_topic}"
-                ));
+                return Err("Response topic mismatch".into());
             }
         }
 
@@ -221,6 +220,7 @@ where
     data_channel_opened: Arc<AtomicBool>,
     heartbeat_last_response: Arc<AtomicU64>,
     heartbeat_running: Arc<AtomicBool>,
+    heartbeat_stop_tx: Arc<Mutex<Option<Sender<()>>>>,
     network_probe_running: Arc<AtomicBool>,
     throttle_limits: Arc<HashMap<String, f64>>,
     last_process_time: Arc<Mutex<HashMap<String, f64>>>,
@@ -250,6 +250,7 @@ where
             data_channel_opened: Arc::clone(&self.data_channel_opened),
             heartbeat_last_response: Arc::clone(&self.heartbeat_last_response),
             heartbeat_running: Arc::clone(&self.heartbeat_running),
+            heartbeat_stop_tx: Arc::clone(&self.heartbeat_stop_tx),
             network_probe_running: Arc::clone(&self.network_probe_running),
             throttle_limits: Arc::clone(&self.throttle_limits),
             last_process_time: Arc::clone(&self.last_process_time),
@@ -267,6 +268,10 @@ impl<T> DataChannelService<T>
 where
     T: DataChannelPort + 'static,
 {
+    /// Legacy constructor; prefer `try_new` for recoverable startup errors.
+    ///
+    /// # Panics
+    /// Panics if the router thread cannot start.
     pub fn new(
         transport: Arc<T>,
         incoming_rx: Receiver<IngressMessage>,
@@ -274,6 +279,51 @@ where
         lidar_worker_pool: Arc<LidarWorkerPool>,
         is_remote_connection: bool,
     ) -> Self {
+        Self::try_new(
+            transport,
+            incoming_rx,
+            callback_events_tx,
+            lidar_worker_pool,
+            is_remote_connection,
+        )
+        .expect("failed to spawn datachannel router thread")
+    }
+
+    /// Assemble routing, returning a sanitized error if its worker cannot start.
+    ///
+    /// # Errors
+    /// Returns an error on OS thread creation failure; consumes and releases its inputs.
+    pub fn try_new(
+        transport: Arc<T>,
+        incoming_rx: Receiver<IngressMessage>,
+        callback_events_tx: EventSender,
+        lidar_worker_pool: Arc<LidarWorkerPool>,
+        is_remote_connection: bool,
+    ) -> PortResult<Self> {
+        Self::try_new_with_spawner(
+            transport,
+            incoming_rx,
+            callback_events_tx,
+            lidar_worker_pool,
+            is_remote_connection,
+            &mut |builder, job| builder.spawn(job),
+        )
+    }
+
+    pub(crate) fn try_new_with_spawner<F>(
+        transport: Arc<T>,
+        incoming_rx: Receiver<IngressMessage>,
+        callback_events_tx: EventSender,
+        lidar_worker_pool: Arc<LidarWorkerPool>,
+        is_remote_connection: bool,
+        spawn: &mut F,
+    ) -> PortResult<Self>
+    where
+        F: FnMut(
+            thread::Builder,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<thread::JoinHandle<()>>,
+    {
         let mut throttle_limits = HashMap::new();
         throttle_limits.insert("rt/utlidar/voxel_map_compressed".to_string(), 1.0 / 15.0);
         throttle_limits.insert(dc_types().vid.to_string(), 1.0 / 15.0);
@@ -294,6 +344,7 @@ where
             data_channel_opened: Arc::new(AtomicBool::new(false)),
             heartbeat_last_response: Arc::new(AtomicU64::new(0)),
             heartbeat_running: Arc::new(AtomicBool::new(false)),
+            heartbeat_stop_tx: Arc::new(Mutex::new(None)),
             network_probe_running: Arc::new(AtomicBool::new(false)),
             throttle_limits: Arc::new(throttle_limits),
             last_process_time: Arc::new(Mutex::new(HashMap::new())),
@@ -314,14 +365,15 @@ where
         let owner = Arc::downgrade(service.external_owner.as_ref().unwrap());
         let mut service_for_router = service.clone();
         service_for_router.external_owner = None;
-        thread::Builder::new()
-            .name("unitree-dc-router".to_string())
-            .spawn(move || {
+        spawn(
+            thread::Builder::new().name("unitree-dc-router".to_string()),
+            Box::new(move || {
                 service_for_router.run_message_loop(incoming_rx, owner);
-            })
-            .expect("failed to spawn datachannel router thread");
+            }),
+        )
+        .map_err(|_| "Failed to start datachannel router".to_string())?;
 
-        service
+        Ok(service)
     }
 
     pub async fn publish(
@@ -580,8 +632,14 @@ where
         true
     }
 
-    pub fn stop_background_tasks(&self) {
+    fn stop_heartbeat(&self) {
         self.heartbeat_running.store(false, Ordering::Relaxed);
+        // Disconnect persists even when the heartbeat has not entered its wait yet.
+        self.heartbeat_stop_tx.lock().unwrap().take();
+    }
+
+    pub fn stop_background_tasks(&self) {
+        self.stop_heartbeat();
         self.network_probe_running.store(false, Ordering::Relaxed);
         self.data_channel_opened.store(false, Ordering::Relaxed);
         self.start_new_session();
@@ -600,7 +658,7 @@ where
                 "Transport cannot prepare a new ingress session"
             );
         }
-        self.heartbeat_running.store(false, Ordering::Relaxed);
+        self.stop_heartbeat();
         self.network_probe_running.store(false, Ordering::Relaxed);
         self.data_channel_opened.store(false, Ordering::Relaxed);
         self.heartbeat_last_response.store(0, Ordering::Relaxed);
@@ -670,12 +728,12 @@ where
                     self.diagnostics.control_send.record();
                 }
                 self.data_channel_opened.store(false, Ordering::Relaxed);
-                self.heartbeat_running.store(false, Ordering::Relaxed);
+                self.stop_heartbeat();
                 self.network_probe_running.store(false, Ordering::Relaxed);
                 self.chunk_data_storage.lock().unwrap().clear();
                 self.fail_all_pending(&error);
             }
-            DcMessage::Text(text) => match serde_json::from_str::<Value>(&text) {
+            DcMessage::Text(text) => match parse_json(text.as_bytes()) {
                 Ok(parsed) => {
                     self.run_resolve(&parsed);
                     self.handle_text_response(&parsed);
@@ -747,6 +805,11 @@ where
         };
         match parse() {
             Ok(Some(bytes)) => {
+                if bytes.len() > MAX_BINARY_EXPANSION_BYTES {
+                    self.fail_pending(&key, "Binary JSON expansion exceeds 1 MiB");
+                    self.diagnostics.chunk.record();
+                    return true;
+                }
                 let mut merged = message.clone();
                 *merged
                     .pointer_mut(path)
@@ -980,6 +1043,10 @@ where
     }
 
     fn deal_array_buffer(&self, buffer: &[u8]) -> Option<Value> {
+        if buffer.len() > MAX_BINARY_BYTES {
+            self.diagnostics.binary.record();
+            return None;
+        }
         match super::framing::parse(buffer) {
             Ok((frame, header, payload)) => self.process_binary_payload(frame, header, payload),
             Err(_) => {
@@ -1042,6 +1109,13 @@ where
             }
             return None;
         }
+        if binary_data.len() > MAX_BINARY_EXPANSION_BYTES {
+            let key = Self::incoming_key(&decoded_json);
+            self.chunk_data_storage.lock().unwrap().remove(&key);
+            self.fail_pending(&key, "Binary JSON expansion exceeds 1 MiB");
+            self.diagnostics.binary.record();
+            return None;
+        }
         if !self.should_process(&topic_or_type) {
             return None;
         }
@@ -1086,6 +1160,8 @@ where
             return;
         }
 
+        let (stop_tx, stop_rx) = bounded(0);
+        *self.heartbeat_stop_tx.lock().unwrap() = Some(stop_tx);
         let epoch = self.session_id.load(Ordering::SeqCst);
         let owner = self.owner_lifetime.clone();
         let mut service = self.clone();
@@ -1109,7 +1185,7 @@ where
                             elapsed_sec = now.saturating_sub(last),
                             "Heartbeat timeout detected"
                         );
-                        service.heartbeat_running.store(false, Ordering::Relaxed);
+                        service.stop_heartbeat();
                         service.data_channel_opened.store(false, Ordering::Relaxed);
                         service.fail_all_pending("Heartbeat timeout");
                         service.chunk_data_storage.lock().unwrap().clear();
@@ -1126,7 +1202,11 @@ where
                     }
 
                     drop(lifecycle);
-                    thread::sleep(Duration::from_secs(2));
+                    if stop_rx.recv_timeout(Duration::from_secs(2))
+                        != Err(RecvTimeoutError::Timeout)
+                    {
+                        break;
+                    }
                 }
             })
             .expect("failed to spawn heartbeat thread");
@@ -1329,6 +1409,204 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn boundary_response_topic_mismatch_redacts_arbitrary_peer_values() {
+        let expectation = ResponseExpectation::for_api_request("expected/request", 1001);
+        let error = expectation
+            .validate(&json!({"topic":"sentinel-private-key"}))
+            .unwrap_err();
+        assert_eq!(error, "Response topic mismatch");
+    }
+
+    #[test]
+    fn boundary_custom_ingress_rejects_oversized_text_before_validation_side_effects() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let text = format!(
+            "{{\"type\":\"validation\",\"data\":\"Validation Ok.\",\"padding\":\"{}\"}}",
+            "x".repeat(1024 * 1024)
+        );
+        service.process_ingress(
+            DcMessage::Text(text).for_generation(service.session_id.load(Ordering::SeqCst)),
+        );
+        assert!(
+            !service.is_open(),
+            "oversized custom ingress changed validation state"
+        );
+    }
+
+    #[test]
+    fn boundary_custom_ingress_rejects_excessive_json_nodes_before_side_effects() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let text = format!(
+            "{{\"type\":\"validation\",\"data\":\"Validation Ok.\",\"padding\":[{}]}}",
+            std::iter::repeat_n("0", 65_536)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        service.process_ingress(
+            DcMessage::Text(text).for_generation(service.session_id.load(Ordering::SeqCst)),
+        );
+        assert!(
+            !service.is_open(),
+            "excessive JSON nodes changed validation state"
+        );
+    }
+
+    #[test]
+    fn boundary_binary_expansion_rejects_one_over_limit_without_partial_result() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let header = br#"{"type":"res","topic":"custom"}"#;
+        let mut frame = (header.len() as u16).to_le_bytes().to_vec();
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(header);
+        frame.resize(frame.len() + 1024 * 1024 + 1, 7);
+        assert!(
+            service.deal_array_buffer(&frame).is_none(),
+            "oversized binary result expanded into JSON"
+        );
+    }
+
+    fn expansion_chunk(file_schema: bool, index: usize, bytes: String) -> Value {
+        let metadata = json!({"enable_chunking":true,"chunk_index":index,"total_chunk_num":2});
+        if file_schema {
+            json!({"type":"res","topic":"custom","info":{"file":{
+                "enable_chunking":true,"chunk_index":index,"total_chunk_num":2,"data":bytes
+            }}})
+        } else {
+            json!({"type":"res","topic":"custom","data":{"content_info":metadata,"data":bytes}})
+        }
+    }
+
+    #[test]
+    fn boundary_chunk_expansion_fails_pending_and_clears_assembly() {
+        for file_schema in [false, true] {
+            let (service, _channel, _tx, _rx) = make_service("open");
+            let first = expansion_chunk(file_schema, 1, "a".repeat(512 * 1024));
+            let key = DataChannelService::<MockDataChannel>::incoming_key(&first);
+            let (sender, mut receiver) = oneshot::channel();
+            let generation = service.session_id.load(Ordering::SeqCst);
+            service.pending_callbacks.lock().unwrap().insert(
+                key,
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender,
+                    expectation: ResponseExpectation::any(),
+                    session_id: generation,
+                },
+            );
+            service.process_ingress(DcMessage::Text(first.to_string()).for_generation(generation));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            let last = expansion_chunk(file_schema, 2, "b".repeat(512 * 1024 + 1));
+            service.process_ingress(DcMessage::Text(last.to_string()).for_generation(generation));
+            assert_eq!(
+                receiver.try_recv().unwrap().err().as_deref(),
+                Some("Binary JSON expansion exceeds 1 MiB")
+            );
+            assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+            assert!(service.pending_callbacks.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn boundary_chunk_expansion_accepts_exact_limit_in_both_schemas() {
+        for file_schema in [false, true] {
+            let (service, _channel, _tx, _rx) = make_service("open");
+            let first = expansion_chunk(file_schema, 1, "a".repeat(512 * 1024));
+            let key = DataChannelService::<MockDataChannel>::incoming_key(&first);
+            let (sender, mut receiver) = oneshot::channel();
+            let generation = service.session_id.load(Ordering::SeqCst);
+            service.pending_callbacks.lock().unwrap().insert(
+                key,
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender,
+                    expectation: ResponseExpectation::any(),
+                    session_id: generation,
+                },
+            );
+            service.process_ingress(DcMessage::Text(first.to_string()).for_generation(generation));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            let last = expansion_chunk(file_schema, 2, "b".repeat(512 * 1024));
+            service.process_ingress(DcMessage::Text(last.to_string()).for_generation(generation));
+            let result = receiver.try_recv().unwrap().unwrap();
+            let path = if file_schema {
+                "/info/file/data"
+            } else {
+                "/data/data"
+            };
+            let bytes = result.pointer(path).unwrap().as_array().unwrap();
+            assert_eq!(bytes.len(), 1024 * 1024);
+            assert_eq!(bytes[0], 97);
+            assert_eq!(bytes[bytes.len() - 1], 98);
+            assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn boundary_binary_expansion_accepts_exact_limit() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let header = br#"{"type":"res","topic":"custom"}"#;
+        let mut frame = (header.len() as u16).to_le_bytes().to_vec();
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(header);
+        frame.resize(frame.len() + 1024 * 1024, 7);
+        let result = service.deal_array_buffer(&frame).unwrap();
+        let bytes = result["data"]["data"].as_array().unwrap();
+        assert_eq!(bytes.len(), 1024 * 1024);
+        assert_eq!(bytes[0], 7);
+        assert_eq!(bytes[bytes.len() - 1], 7);
+    }
+
+    #[test]
+    fn boundary_binary_expansion_error_clears_pending_and_partial_chunks_before_throttle() {
+        for topic in ["custom", "vid"] {
+            let (service, _channel, _tx, _rx) = make_service("open");
+            let header = json!({"type":"res","topic":topic});
+            let key = DataChannelService::<MockDataChannel>::incoming_key(&header);
+            let (sender, mut receiver) = oneshot::channel();
+            service.pending_callbacks.lock().unwrap().insert(
+                key.clone(),
+                PendingCallback {
+                    token: Arc::new(()),
+                    sender,
+                    expectation: ResponseExpectation::any(),
+                    session_id: service.session_id.load(Ordering::SeqCst),
+                },
+            );
+            service
+                .chunk_data_storage
+                .lock()
+                .unwrap()
+                .insert(&key, "/data/data", 1, 2, vec![1], std::time::Instant::now())
+                .unwrap();
+            service.last_process_time.lock().unwrap().insert(
+                topic.into(),
+                DataChannelService::<MockDataChannel>::now_secs_f64() + 1000.0,
+            );
+            let header = serde_json::to_vec(&header).unwrap();
+            let mut frame = (header.len() as u16).to_le_bytes().to_vec();
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(&header);
+            frame.resize(frame.len() + 1024 * 1024 + 1, 7);
+            assert!(service.deal_array_buffer(&frame).is_none());
+            assert_eq!(
+                receiver
+                    .try_recv()
+                    .expect("oversize failure must complete pending RPC immediately")
+                    .err()
+                    .as_deref(),
+                Some("Binary JSON expansion exceeds 1 MiB")
+            );
+            assert!(service.chunk_data_storage.lock().unwrap().is_empty());
+        }
+    }
 
     #[derive(Default)]
     struct MockDataChannel {
@@ -1544,6 +1822,165 @@ mod tests {
             weak.upgrade().is_none(),
             "router must not own the service lifetime"
         );
+    }
+
+    #[test]
+    fn heartbeat_stop_releases_producers_before_next_tick() {
+        let (service, channel, _ingress, events) = make_service("open");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        release.wait();
+        // Stop takes the lifecycle lock after the admitted first heartbeat send.
+        service.stop_background_tasks();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "stopped heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    #[test]
+    fn heartbeat_stop_before_wait_releases_producers_before_next_tick() {
+        let (service, channel, _ingress, events) = make_service("open");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        let stopping = service.clone();
+        let stop = thread::spawn(move || stopping.stop_background_tasks());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        // Hold the first send until cancellation, so the worker cannot have parked yet.
+        while service.heartbeat_stop_tx.lock().unwrap().is_some()
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        let cancelled_before_wait = service.heartbeat_stop_tx.lock().unwrap().is_none();
+        release.wait();
+        stop.join().unwrap();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            cancelled_before_wait,
+            "stop waited for the next heartbeat tick"
+        );
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "cancellation before parking failed to release heartbeat producers"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    #[test]
+    fn heartbeat_final_owner_drop_releases_producers_before_next_tick() {
+        let (service, channel, _ingress, events) = make_service("open");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        release.wait();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "orphaned heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    fn heartbeat_without_router() -> (
+        DataChannelService<MockDataChannel>,
+        Arc<MockDataChannel>,
+        EventReceiver,
+    ) {
+        let (_ingress, incoming) = bounded(1);
+        let (events_tx, events) = event_channel(1).unwrap();
+        let pool = Arc::new(LidarWorkerPool::new(events_tx.clone(), 1));
+        let channel = Arc::new(MockDataChannel {
+            state: "open",
+            ..MockDataChannel::default()
+        });
+        let service = DataChannelService::try_new_with_spawner(
+            channel.clone(),
+            incoming,
+            events_tx,
+            pool,
+            false,
+            &mut |builder, router| {
+                // Stub routing only: its final stop must not mask a missing heartbeat wake.
+                drop(router);
+                builder.spawn(|| {})
+            },
+        )
+        .unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *channel.send_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+        service.start_heartbeat();
+        entered.wait();
+        release.wait();
+        (service, channel, events)
+    }
+
+    #[test]
+    fn heartbeat_reset_releases_producers_before_next_tick() {
+        let (service, channel, events) = heartbeat_without_router();
+        service.start_new_session();
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "reset heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
+    }
+
+    #[test]
+    fn heartbeat_transport_fault_releases_producers_before_next_tick() {
+        let (service, channel, events) = heartbeat_without_router();
+        let generation = service.session_id.load(Ordering::SeqCst);
+        service.process_ingress(
+            DcMessage::TransportFault("fixture send failure".into()).for_generation(generation),
+        );
+        let weak_transport = Arc::downgrade(&channel);
+        drop(channel);
+        drop(service);
+
+        assert!(
+            matches!(
+                events.recv_timeout(Duration::from_secs(1)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "faulted heartbeat retained event producers until its next live tick"
+        );
+        assert!(weak_transport.upgrade().is_none());
     }
 
     #[test]

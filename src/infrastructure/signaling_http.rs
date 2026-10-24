@@ -5,9 +5,10 @@ use crate::infrastructure::security::{
 use crate::protocol::ports::{PortResult, SignalingPort};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::{json, Value};
 use std::future::Future;
+use std::net::{IpAddr, Ipv6Addr};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -49,8 +50,65 @@ impl Default for HttpSignalingClient {
 fn signaling_client() -> Result<Client, String> {
     Client::builder()
         .timeout(SIGNALING_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .map_err(|_| "Signaling HTTP client initialization failed".into())
+}
+
+fn signaling_url(host: &str, port: u16, path: &str) -> Result<Url, String> {
+    let invalid = || "Invalid signaling host: expected only an IP address or hostname".to_string();
+    if host.is_empty() || host.len() > 254 {
+        return Err(invalid());
+    }
+    let ip = if let Some(inner) = host.strip_prefix('[') {
+        Some(IpAddr::V6(
+            inner
+                .strip_suffix(']')
+                .ok_or_else(invalid)?
+                .parse::<Ipv6Addr>()
+                .map_err(|_| invalid())?,
+        ))
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        Some(ip)
+    } else {
+        let name = host.strip_suffix('.').unwrap_or(host);
+        if name.is_empty()
+            || name.len() > 253
+            || name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            || !name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return Err(invalid());
+        }
+        None
+    };
+
+    let mut url = Url::parse("http://localhost/").map_err(|_| invalid())?;
+    if let Some(ip) = ip {
+        url.set_ip_host(ip).map_err(|_| invalid())?;
+    } else {
+        // set_host alone accepts/truncates authority suffixes; validate the entire input first.
+        url.set_host(Some(host)).map_err(|_| invalid())?;
+        if !url
+            .host_str()
+            .is_some_and(|parsed| parsed.eq_ignore_ascii_case(host))
+        {
+            return Err(invalid());
+        }
+    }
+    url.set_port(Some(port)).map_err(|_| invalid())?;
+    url.set_path(path);
+    Ok(url)
 }
 
 fn signaling_error(prefix: &str, error: &reqwest::Error) -> String {
@@ -90,7 +148,7 @@ async fn read_response(mut response: reqwest::Response) -> Result<String, String
 }
 
 pub async fn send_sdp_local_old(ip: &str, sdp_json: &str) -> Result<String, String> {
-    let url = format!("http://{ip}:8081/offer");
+    let url = signaling_url(ip, 8081, "/offer")?;
     crate::infrastructure::ensure_crypto_provider();
     let client = signaling_client()?;
 
@@ -121,9 +179,9 @@ async fn send_sdp_local_new_with_aes_key(
     sdp_json: &str,
     aes_128_key: Option<&str>,
 ) -> Result<String, String> {
+    let notify_url = signaling_url(ip, 9991, "/con_notify")?;
     crate::infrastructure::ensure_crypto_provider();
     let client = signaling_client()?;
-    let notify_url = format!("http://{ip}:9991/con_notify");
 
     let response = client
         .post(notify_url)
@@ -165,7 +223,7 @@ async fn send_sdp_local_new_with_aes_key(
         "data2": rsa_encrypt(&aes_key, &public_key)?,
     });
 
-    let ingest_url = format!("http://{ip}:9991/con_ing_{path_ending}");
+    let ingest_url = signaling_url(ip, 9991, &format!("/con_ing_{path_ending}"))?;
     let response = client
         .post(ingest_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -304,6 +362,142 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use serde_json::json;
+
+    #[test]
+    fn boundary_signaling_builds_only_structured_local_endpoints() {
+        for (host, authority) in [
+            ("192.168.123.161", "192.168.123.161"),
+            ("go2-01.local", "go2-01.local"),
+            ("go2-01.local.", "go2-01.local."),
+            ("::1", "[::1]"),
+            ("[2001:db8::1]", "[2001:db8::1]"),
+        ] {
+            let url = super::signaling_url(host, 9991, "/con_notify").unwrap();
+            assert_eq!(url.as_str(), format!("http://{authority}:9991/con_notify"));
+            assert!(url.username().is_empty());
+            assert!(url.password().is_none());
+            assert!(url.query().is_none());
+            assert!(url.fragment().is_none());
+        }
+    }
+
+    #[test]
+    fn boundary_signaling_rejects_ambiguous_numeric_and_invalid_dns_hosts() {
+        for host in [
+            "",
+            ".",
+            "127.1",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "2130706433",
+            "go2..local",
+            "-go2.local",
+            "go2-.local",
+            "[::1",
+            "::1]",
+            "[::1%25zone]",
+            "[::1]:123",
+        ] {
+            let error = super::signaling_url(host, 8081, "/offer").err();
+            assert_eq!(
+                error.as_deref(),
+                Some("Invalid signaling host: expected only an IP address or hostname"),
+                "noncanonical or malformed host admitted"
+            );
+        }
+        for host in ["x".repeat(64), "x".repeat(255)] {
+            assert!(super::signaling_url(&host, 8081, "/offer").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_signaling_ignores_environment_proxies() {
+        const TEST: &str =
+            "infrastructure::signaling_http::tests::boundary_signaling_ignores_environment_proxies";
+        const FIXTURE_ENV: &str = "UNITREE_SIGNALING_PROXY_FIXTURE";
+        if std::env::var(FIXTURE_ENV).ok().as_deref() != Some("1") {
+            // Keep process-global proxy settings out of unrelated parallel tests.
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env(FIXTURE_ENV, "1");
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                command.env(name, "http://127.0.0.1:9");
+            }
+            command.env("NO_PROXY", "").env("no_proxy", "");
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "proxy fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+            return;
+        }
+        let response = response_fixture(false, 5).await;
+        assert_eq!(super::read_response(response).await.unwrap(), "xxxxx");
+    }
+
+    #[tokio::test]
+    async fn boundary_signaling_rejects_non_host_input_before_requesting() {
+        for host in [
+            "127.0.0.1:54321",
+            "sentinel-private-key@127.0.0.1",
+            "127.0.0.1/sentinel-private-key",
+            "127.0.0.1?sentinel-private-key",
+            "127.0.0.1#sentinel-private-key",
+            "127.0.0.1\\sentinel-private-key",
+            "127.0.0.1%2fsentinel-private-key",
+            "http://127.0.0.1",
+            " 127.0.0.1",
+            "127.0.0.1\t",
+            "[::1]:54321",
+            "[::1]suffix",
+        ] {
+            assert_eq!(
+                super::send_sdp_local_old(host, "{}").await.unwrap_err(),
+                "Invalid signaling host: expected only an IP address or hostname",
+                "malformed host was not rejected at admission"
+            );
+            assert_eq!(
+                super::send_sdp_local_new(host, "{}").await.unwrap_err(),
+                "Invalid signaling host: expected only an IP address or hostname"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_signaling_does_not_follow_peer_redirects() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            write!(socket, "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{}/sentinel-private-key\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", address.port()).unwrap();
+            // Dropping the listener makes a mistakenly followed redirect fail immediately.
+        });
+        crate::infrastructure::ensure_crypto_provider();
+        let response = super::signaling_client()
+            .unwrap()
+            .post(format!("http://{address}/offer"))
+            .body("sentinel-private-sdp")
+            .send()
+            .await;
+        server.join().unwrap();
+        assert!(
+            response.is_ok_and(|reply| reply.status() == reqwest::StatusCode::TEMPORARY_REDIRECT),
+            "signaling client followed the redirect instead of returning its status"
+        );
+    }
 
     async fn response_fixture(chunked: bool, size: usize) -> reqwest::Response {
         use std::io::{Read, Write};

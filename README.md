@@ -49,7 +49,7 @@ See the [current architecture and extension map](docs/architecture_analysis.md) 
 **Key design decisions:**
 
 - **Single-session ownership** — Rust owns the WebRTC peer connection lifecycle; Python never touches `aiortc`.
-- **Rust-owned hot path** — WebRTC, LiDAR decode and media workers do not run Python code. API conversions and Python callbacks still require PyO3 attachment; this is not a free-threaded CPython safety or end-to-end GIL-removal claim.
+- **Rust-owned hot path** — WebRTC, LiDAR decode and media workers do not run Python code. API conversions and Python callbacks still require PyO3 attachment; the extension explicitly requires the GIL and does not claim free-threaded support.
 - **Bounded resource admission** — count/byte budgets limit queued callback buffers; admission uses synchronization, and overflow has explicit error/drop policies. This is not a lock-free or whole-process memory guarantee.
 - **Async integration** — `pyo3-async-runtimes` bridges Rust Tokio futures to Python `asyncio`; input conversion and Python callbacks still require Python attachment.
 
@@ -196,6 +196,17 @@ For Go2 firmware `1.1.15+`, the LAN `/con_notify` handshake may use `data2=3`,
 which requires the robot's per-device AES-128 hex key. Pass it with
 `aes_128_key=...` or set `GO2_DORA_UNITREE_AES_128_KEY`.
 
+`ip` is a host, not a URL or `host:port`; local signaling disables proxies and redirects. Construction can raise `RuntimeError` if a native worker/dispatcher cannot start. Malformed or oversized Python/peer inputs now fail at explicit software admission boundaries; these ceilings are not firmware maxima. See [resource and migration contracts](docs/engineering/resource-policy.md).
+
+Disconnect retains callbacks for reconnect. For final cleanup, explicitly release callback captures, then await transport cleanup while the runtime is alive:
+
+```python
+conn.clear_callbacks()  # Synchronous; not disconnect/unsubscribe/media-off.
+await conn.disconnect()
+```
+
+An already-admitted callback may finish; finalizers may register new callbacks. This is not terminal close or automatic garbage collection. See [callback ownership](docs/engineering/resource-policy.md#explicit-python-callback-release). Connection `connect`/`disconnect`/`reconnect` and audio playback/stop futures retain their existing `()` success value, reflected in the shipped [API stub](unitree_webrtc_rs.pyi).
+
 ### Query Sport State
 
 ```python
@@ -308,60 +319,24 @@ asyncio.run(main())
 
 ### Audio Receive
 
-```python
-import asyncio
-from unitree_webrtc_rs import UnitreeWebRTCConnection, WebRTCConnectionMethod
+Only on an authorized, verified audio-capable model:
 
-async def main():
-    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="192.168.12.1")
-    await conn.connect()
-
-    received = 0
-
-    def on_audio(samples):
-        nonlocal received
-        received += 1
-        # samples: numpy ndarray int16, 1920 samples per frame, 48kHz stereo
-        # Process samples here; avoid printing on every callback.
-
-    conn.audio.on_audio(on_audio)
-    conn.audio.switchAudioChannel(True)
-
-    await asyncio.sleep(10)
-
-    conn.audio.switchAudioChannel(False)
-    await conn.disconnect()
-    print(f"Audio frames received: {received}")
-
-asyncio.run(main())
+```bash
+uv run --locked --no-sync python examples/audio_receive.py --ip "$ROBOT_IP" --duration 5
 ```
+
+The example validates native interleaved `int16` arrays, retains at most four frames (at most 96,000 samples each), and drops newest on overflow. PyAudio is optional and imported only when running reception; without it, the example analyzes samples without local playback. Blocking writes are offloaded and observed before closing the stream. Media disable, device cleanup and disconnect are attempted independently; a hung device operation can still delay cleanup. These are example-local limits, not codec/robot maxima or physical audio validation.
 
 ### Audio Transmit (PC → Robot)
 
-Requires GStreamer installed. Supports local files (WAV/MP3/OGG) and HTTP stream URLs.
+Requires GStreamer and operator authorization: this plays sound on the robot. Supports local files (WAV/MP3/OGG) and HTTP stream URLs.
 
-```python
-import asyncio
-from unitree_webrtc_rs import UnitreeWebRTCConnection, WebRTCConnectionMethod
-
-async def main():
-    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="192.168.12.1")
-    await conn.connect()
-
-    # Play a local file
-    await conn.audio.play_from_file("/path/to/audio.wav")
-    await asyncio.sleep(10)
-    await conn.audio.stop()
-
-    # Or stream from URL
-    await conn.audio.play_from_url("https://example.com/stream.mp3")
-    await asyncio.sleep(10)
-    await conn.audio.stop()
-
-    await conn.disconnect()
-
-asyncio.run(main())
+```bash
+uv run --locked --no-sync python examples/audio_play_file.py --ip "$ROBOT_IP" --file /path/to/audio.wav --duration 5
+uv run --locked --no-sync python examples/audio_stream_url.py --ip "$ROBOT_IP" --url https://example.com/stream.mp3 --duration 5
 ```
+
+Both use shared address/auth/duration validation and attempt stop before independent disconnect, including after startup failure. Awaiting session audio stop observes owned native/RTP cleanup; canceling its waiter does not abandon that cleanup. This does not make a hung native call bounded, and final object drop is only best effort. Audio has not been independently physically validated.
 
 ## Python API Reference
 
@@ -495,7 +470,7 @@ Rust filters do not control Python `logging`/`print` or native GStreamer `GST_DE
 
 ## Examples
 
-Run after `make build`. Non-audio examples require `--ip` or `ROBOT_IP`; no device address is selected implicitly. Supply the per-device key with `UNITREE_AES_128_KEY`, a private `UNITREE_AES_128_KEY_FILE`, or `--aes-128-key-file -` (stdin). Do not put real keys in shell history or command arguments. `--duration` is finite and bounded. Non-audio examples exit nonzero on failed connection, missing/invalid data or incomplete cleanup.
+Run after `make build`. The examples below and the three [audio examples](#audio-receive) require `--ip` or `ROBOT_IP`; no device address is selected implicitly. Supply the per-device key with `UNITREE_AES_128_KEY`, a private `UNITREE_AES_128_KEY_FILE`, or `--aes-128-key-file -` (stdin). Do not put real keys in shell history or command arguments. `--duration` is finite and bounded. These examples exit nonzero on failed connection, missing/invalid data or incomplete cleanup.
 
 ```bash
 # Set ROBOT_IP to your device, never a repository-wide default.

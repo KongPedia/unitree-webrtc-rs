@@ -1,5 +1,6 @@
 use crate::diagnostics::RepeatLog;
 use crate::infrastructure::rtc_engine::state::{apply_event, RtcReadyState, RtcStateEvent};
+use crate::protocol::ingress::{MAX_BINARY_BYTES, MAX_TEXT_BYTES};
 use crate::protocol::models::{DcMessage, IngressMessage};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -26,6 +27,10 @@ pub fn bind_data_channel_handlers(
         "incoming_queue_disconnected",
     ));
     let invalid_text = Arc::new(RepeatLog::new("datachannel_invalid_utf8", "invalid_utf8"));
+    let oversized = Arc::new(RepeatLog::new(
+        "datachannel_ingress_rejected",
+        "message_size",
+    ));
     let open_state = Arc::clone(&ready_state);
     let open_generation = Arc::clone(&current_generation);
     data_channel.on_open(Box::new(move || {
@@ -60,6 +65,7 @@ pub fn bind_data_channel_handlers(
         let full = Arc::clone(&full);
         let closed = Arc::clone(&closed);
         let invalid_text = Arc::clone(&invalid_text);
+        let oversized = Arc::clone(&oversized);
         Box::pin(async move {
             if matches!(
                 RtcReadyState::from_u8(ready_state.load(Ordering::SeqCst)),
@@ -68,6 +74,10 @@ pub fn bind_data_channel_handlers(
                 return;
             }
             if generation != current_generation.load(Ordering::SeqCst) {
+                return;
+            }
+            if !message_size_allowed(message.is_string, message.data.len()) {
+                oversized.record();
                 return;
             }
             if message.is_string {
@@ -194,7 +204,18 @@ pub fn bind_peer_connection_handlers(
 }
 
 fn decode_text_message(data: &[u8]) -> Option<String> {
+    if data.len() > MAX_TEXT_BYTES {
+        return None;
+    }
     std::str::from_utf8(data).ok().map(str::to_owned)
+}
+
+fn message_size_allowed(is_string: bool, size: usize) -> bool {
+    size <= if is_string {
+        MAX_TEXT_BYTES
+    } else {
+        MAX_BINARY_BYTES
+    }
 }
 
 fn print_status(status_type: &str, status_message: &str) {
@@ -218,6 +239,24 @@ fn print_status(status_type: &str, status_message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_peer_admission_keeps_text_and_binary_policies_distinct() {
+        assert!(message_size_allowed(true, 1024 * 1024));
+        assert!(!message_size_allowed(true, 1024 * 1024 + 1));
+        assert!(message_size_allowed(false, 1152 * 1024));
+        assert!(!message_size_allowed(false, 1152 * 1024 + 1));
+    }
+
+    #[test]
+    fn boundary_text_size_is_checked_before_owned_copy() {
+        let text = vec![b'x'; 1024 * 1024 + 1];
+        assert!(decode_text_message(&text).is_none());
+        assert_eq!(
+            decode_text_message(&text[..1024 * 1024]).unwrap().len(),
+            1024 * 1024
+        );
+    }
 
     #[test]
     fn datachannel_text_rejects_invalid_utf8_and_preserves_valid_text() {

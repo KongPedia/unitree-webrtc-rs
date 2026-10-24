@@ -9,13 +9,55 @@ use pyo3::types::PyDict;
 use std::thread;
 use tracing::warn;
 
+pub(crate) fn clear_callback_registry(py: Python<'_>, registry: &CallbackRegistry) -> PyResult<()> {
+    let previous = {
+        let mut registry = registry.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("callback registry lock poisoned")
+        })?;
+        std::mem::take(&mut *registry)
+    };
+    // Finalizers can reenter registration; drop attached to Python, after releasing the lock.
+    for registration in previous.into_values() {
+        registration.callback.drop_ref(py);
+    }
+    Ok(())
+}
+
+/// Legacy dispatcher entry point; prefer `try_spawn_callback_dispatcher`.
+///
+/// # Panics
+/// Panics if the dispatcher thread cannot start.
 pub fn spawn_callback_dispatcher(
     callback_events_rx: EventReceiver,
     callback_registry: CallbackRegistry,
 ) {
-    thread::Builder::new()
-        .name("unitree-python-dispatcher".to_string())
-        .spawn(move || {
+    try_spawn_callback_dispatcher_with(callback_events_rx, callback_registry, |builder, job| {
+        builder.spawn(job)
+    })
+    .expect("failed to spawn python callback dispatcher");
+}
+
+/// Start Python event delivery, returning a sanitized error if the thread cannot start.
+pub fn try_spawn_callback_dispatcher(
+    callback_events_rx: EventReceiver,
+    callback_registry: CallbackRegistry,
+) -> Result<(), String> {
+    try_spawn_callback_dispatcher_with(callback_events_rx, callback_registry, |builder, job| {
+        builder.spawn(job)
+    })
+}
+
+pub(crate) fn try_spawn_callback_dispatcher_with<F>(
+    callback_events_rx: EventReceiver,
+    callback_registry: CallbackRegistry,
+    spawn: F,
+) -> Result<(), String>
+where
+    F: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+{
+    spawn(
+        thread::Builder::new().name("unitree-python-dispatcher".to_string()),
+        Box::new(move || {
             let failures = CallbackDiagnostics::new();
             let mut generation = None;
             while let Ok(delivery) = callback_events_rx.recv_delivery() {
@@ -25,8 +67,10 @@ pub fn spawn_callback_dispatcher(
                 }
                 dispatch_delivery(delivery, &callback_registry, &failures);
             }
-        })
-        .expect("failed to spawn python callback dispatcher");
+        }),
+    )
+    .map_err(|_| "Failed to start Python callback dispatcher".to_string())?;
+    Ok(())
 }
 
 fn dispatch_delivery(
@@ -318,6 +362,61 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_clear_preserves_copied_callback_but_suppresses_later_dispatch() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"received=[]\ndef callback(value): received.append(value)",
+                c"clear_dispatch.py",
+                c"clear_dispatch",
+            )
+            .unwrap();
+            let registry: CallbackRegistry = Arc::new(Mutex::new(HashMap::new()));
+            registry.lock().unwrap().insert(
+                "topic".into(),
+                module.getattr("callback").unwrap().unbind().into(),
+            );
+            let (copied, wait_for_copy) = std::sync::mpsc::channel();
+            let (cleared, wait_for_clear) = std::sync::mpsc::channel();
+            let clearing_registry = Arc::clone(&registry);
+            let worker = std::thread::spawn(move || {
+                wait_for_copy
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Python::attach(|py| clear_callback_registry(py, &clearing_registry).unwrap());
+                cleared.send(()).unwrap();
+            });
+            dispatch_callback(
+                &registry,
+                "topic",
+                "topic",
+                &|| true,
+                &CallbackDiagnostics::new(),
+                |py| {
+                    copied.send(()).unwrap();
+                    py.detach(move || {
+                        wait_for_clear
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                    });
+                    Ok(py.None())
+                },
+            );
+            py.detach(|| worker.join().unwrap());
+            assert_eq!(module.getattr("received").unwrap().len().unwrap(), 1);
+            dispatch_event(
+                CallbackEvent::TopicCallback {
+                    topic: "topic".into(),
+                    payload: json!({}),
+                },
+                &registry,
+            );
+            assert_eq!(module.getattr("received").unwrap().len().unwrap(), 1);
+        });
+    }
+
+    #[test]
     fn callback_admission_is_rechecked_after_argument_conversion() {
         Python::initialize();
         Python::attach(|py| {
@@ -480,6 +579,8 @@ mod tests {
                 },
                 &registry,
             );
+            clear_callback_registry(py, &registry).unwrap();
+            assert!(registry.lock().unwrap().is_empty());
             drop(registry);
             py.run(c"video, audio, message = received\npoints = message['data']['data']['points']\nassert video.dtype.name == 'uint8' and video.shape == (1, 1, 3)\nassert video.tolist() == [[[1, 2, 3]]]\nassert video.ctypes.data == video_pointer\nassert audio.dtype.name == 'int16' and audio.tolist() == [4, 5]\nassert points.dtype.name == 'float32' and points.shape == (1, 3)\nassert points.tolist() == [[1.0, 2.0, 3.0]]\nassert points.ctypes.data == points_pointer", Some(&module.dict()), None).unwrap();
         });

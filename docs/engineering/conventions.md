@@ -82,9 +82,9 @@ Model expansion and multi-session scale are different: validate independent cred
 - Do not hold a mutex during Python user callbacks or hold synchronous locks across `.await`. Do not block a Tokio worker on synchronous channel sends when a nonblocking/async boundary is needed.
 - Keep request correlation, expected response and session generation protections. On cancellation, timeout, disconnect and reconnect, pending requests need a deterministic outcome and bounded retained state.
 - Validate packet/header sizes and decompressed size ceilings, chunk order/count/expiry, numeric conversions, finite timeouts and URI schemes before allocation or pipeline construction. Use checked arithmetic and UTF-8-safe/byte-level parsing as appropriate.
-- Log actionable errors with topic/session and redacted context. A repeated recoverable callback error should be observable without killing transport; swallowing every error is not resilience.
+- Log actionable errors with fixed event/category identifiers, numeric session/registration context and redaction; do not echo arbitrary peer topics. A repeated recoverable callback error should be observable without killing transport; swallowing every error is not resilience.
 - Heavy Rust work and blocking waits should not keep Python attached unnecessarily. Python object access still requires PyO3 attachment. `Python::detach` does not make shared data race-free.
-- `unsafe impl Send/Sync` needs a `SAFETY` rationale covering actual library thread affinity and all calling paths. PyO3 0.28's free-threading default is an attestation to audit, not proof that custom unsafe code or GStreamer use is safe.
+- `unsafe impl Send/Sync` needs a `SAFETY` rationale covering actual library thread affinity and all calling paths. The extension and legacy driver explicitly declare GIL use; this support-policy opt-out is not evidence of a discovered race. Do not remove it based only on ordinary GIL-path tests or PyO3 defaults.
 - Scope a zero-copy claim to the specific owned-buffer handoff. Document array dtype, dimensions, strides, mutation and lifetime (including retention after disconnect). Avoid borrowed GStreamer/decoder memory unless the Python owner demonstrably keeps it alive.
 
 ## 7. Change and verification contract
