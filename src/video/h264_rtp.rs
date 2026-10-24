@@ -7,6 +7,7 @@ const MAX_NAL_BYTES: usize = 8 * 1024 * 1024;
 pub struct H264RtpReassembler {
     buffer: Vec<u8>,
     in_progress: bool,
+    next_rtp: Option<(u16, u32)>,
 }
 
 impl Default for H264RtpReassembler {
@@ -20,15 +21,38 @@ impl H264RtpReassembler {
         Self {
             buffer: Vec::with_capacity(65536),
             in_progress: false,
+            next_rtp: None,
         }
     }
 
     fn reset(&mut self) {
         self.buffer.clear();
         self.in_progress = false;
+        self.next_rtp = None;
     }
 
+    /// Reassemble RTP payloads, rejecting FU-A loss, duplicates, reordering and
+    /// timestamp changes. A fresh start fragment recovers an abandoned NAL.
+    pub fn process_rtp_packet(
+        &mut self,
+        payload: &[u8],
+        sequence_number: u16,
+        timestamp: u32,
+    ) -> Option<Vec<u8>> {
+        self.process_payload(payload, Some((sequence_number, timestamp)))
+    }
+
+    /// Legacy payload-only API; continuity cannot be checked without RTP headers.
+    /// Do not mix this and `process_rtp_packet` within a fragmented NAL.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Retain the legacy payload-only entrypoint")
+    )]
     pub fn process_packet(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+        self.process_payload(payload, None)
+    }
+
+    fn process_payload(&mut self, payload: &[u8], rtp: Option<(u16, u32)>) -> Option<Vec<u8>> {
         if payload.is_empty() || payload.len() > MAX_NAL_BYTES || payload[0] & 0x80 != 0 {
             self.reset();
             return None;
@@ -54,6 +78,22 @@ impl H264RtpReassembler {
             return None;
         }
         let header = (payload[0] & 0x60) | unit_type;
+        if !start && self.next_rtp != rtp {
+            self.reset();
+            return None;
+        }
+        if start
+            && rtp
+                .zip(self.next_rtp)
+                .is_some_and(|((sequence, _), (next_sequence, _))| {
+                    sequence.wrapping_sub(next_sequence) >= 0x8000
+                })
+        {
+            // Half-range RTP ordering also handles wraparound; stale starts are
+            // duplicates/reordering, not fresh NAL boundaries.
+            self.reset();
+            return None;
+        }
         if start {
             self.reset();
             self.buffer.push(header);
@@ -67,10 +107,12 @@ impl H264RtpReassembler {
             return None;
         }
         self.buffer.extend_from_slice(&payload[2..]);
+        self.next_rtp = rtp.map(|(sequence, timestamp)| (sequence.wrapping_add(1), timestamp));
         if !end {
             return None;
         }
         self.in_progress = false;
+        self.next_rtp = None;
         Some(std::mem::take(&mut self.buffer))
     }
 }
@@ -205,5 +247,120 @@ mod resource_tests {
             reassembler.process_packet(interruption);
             assert!(reassembler.process_packet(&[0x7c, 0x45, 2]).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+
+    #[test]
+    fn rtp_discontinuity_discards_the_entire_fragmented_nal() {
+        // Each pair is independently invalid after seq=40, ts=90_000:
+        // missing packet, duplicate, reordered packet, different access-unit time.
+        for (sequence, timestamp) in [(42, 90_000), (40, 90_000), (39, 90_000), (41, 93_000)] {
+            let mut nal = H264RtpReassembler::new();
+            assert_eq!(
+                nal.process_rtp_packet(&[0x7c, 0x85, 0xaa], 40, 90_000),
+                None
+            );
+            assert_eq!(
+                nal.process_rtp_packet(&[0x7c, 0x45, 0xbb], sequence, timestamp),
+                None,
+                "discontinuous FU-A must never reach the decoder"
+            );
+            assert_eq!(
+                nal.process_rtp_packet(&[0x7c, 0x45, 0xcc], 43, 90_000),
+                None
+            );
+            assert_eq!(
+                nal.process_rtp_packet(&[0x7c, 0x85, 0x11], 50, 96_000),
+                None
+            );
+            assert_eq!(
+                nal.process_rtp_packet(&[0x7c, 0x45, 0x22], 51, 96_000),
+                Some(vec![0x65, 0x11, 0x22])
+            );
+        }
+    }
+
+    #[test]
+    fn rtp_wraparound_and_timestamps_between_complete_nals_are_valid() {
+        let mut nal = H264RtpReassembler::new();
+        assert_eq!(
+            nal.process_rtp_packet(&[0x7c, 0x85, 0x10], 65535, u32::MAX),
+            None
+        );
+        assert_eq!(
+            nal.process_rtp_packet(&[0x7c, 0x45, 0x20], 0, u32::MAX),
+            Some(vec![0x65, 0x10, 0x20])
+        );
+        assert_eq!(
+            nal.process_rtp_packet(&[0x61, 0x33], 1, 2_999),
+            Some(vec![0x61, 0x33])
+        );
+        assert_eq!(nal.process_rtp_packet(&[0x7c, 0x85, 0x40], 2, 5_999), None);
+        assert_eq!(
+            nal.process_rtp_packet(&[0x7c, 0x45, 0x50], 3, 5_999),
+            Some(vec![0x65, 0x40, 0x50])
+        );
+    }
+
+    #[test]
+    fn new_start_recovers_without_reusing_abandoned_fragment_bytes() {
+        let mut nal = H264RtpReassembler::new();
+        nal.process_rtp_packet(&[0x7c, 0x85, 0xff], 10, 90_000);
+        nal.process_rtp_packet(&[0x7c, 0x85, 0x11], 20, 93_000);
+        assert_eq!(
+            nal.process_rtp_packet(&[0x7c, 0x45, 0x22], 21, 93_000),
+            Some(vec![0x65, 0x11, 0x22])
+        );
+    }
+
+    #[test]
+    fn rtp_metadata_cannot_bypass_assembly_size_limit() {
+        let mut nal = H264RtpReassembler::new();
+        nal.process_rtp_packet(&[0x7c, 0x85, 1], 100, 90_000);
+        let mut fragment = vec![0; 8 * 1024 * 1024];
+        fragment[..2].copy_from_slice(&[0x7c, 0x05]);
+        assert_eq!(nal.process_rtp_packet(&fragment, 101, 90_000), None);
+        assert_eq!(nal.process_rtp_packet(&[0x7c, 0x45, 2], 102, 90_000), None);
+        nal.process_rtp_packet(&[0x7c, 0x85, 3], 103, 93_000);
+        assert_eq!(
+            nal.process_rtp_packet(&[0x7c, 0x45, 4], 104, 93_000),
+            Some(vec![0x65, 3, 4])
+        );
+    }
+}
+
+#[cfg(test)]
+mod rtp_api_tests {
+    use super::*;
+
+    #[test]
+    fn duplicated_or_reordered_starts_cannot_revive_an_older_active_nal() {
+        for (start_sequence, end_sequence) in [(40, 41), (39, 40)] {
+            let mut nal = H264RtpReassembler::new();
+            nal.process_rtp_packet(&[0x7c, 0x85, 0xaa], 40, 90_000);
+            nal.process_rtp_packet(&[0x7c, 0x05, 0xbb], 41, 90_000);
+            nal.process_rtp_packet(&[0x7c, 0x85, 0xcc], start_sequence, 90_000);
+            assert_eq!(
+                nal.process_rtp_packet(&[0x7c, 0x45, 0xdd], end_sequence, 90_000),
+                None,
+                "a stale start fragment must discard, not revive, the active NAL"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicated_start_and_mixed_payload_api_cannot_complete_a_nal() {
+        let mut nal = H264RtpReassembler::new();
+        nal.process_rtp_packet(&[0x7c, 0x85, 1], 10, 90_000);
+        nal.process_rtp_packet(&[0x7c, 0x85, 1], 10, 90_000);
+        assert_eq!(nal.process_rtp_packet(&[0x7c, 0x45, 2], 11, 90_000), None);
+        nal.process_rtp_packet(&[0x7c, 0x85, 3], 12, 93_000);
+        assert_eq!(nal.process_packet(&[0x7c, 0x45, 4]), None);
+        nal.process_packet(&[0x7c, 0x85, 5]);
+        assert_eq!(nal.process_rtp_packet(&[0x7c, 0x45, 6], 14, 96_000), None);
     }
 }

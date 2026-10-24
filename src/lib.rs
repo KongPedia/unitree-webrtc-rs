@@ -102,7 +102,8 @@ fn register_constants(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(feature = "python")]
-#[pymodule]
+// Free-threaded Python is not yet audited; retain the GIL rather than attest support.
+#[pymodule(gil_used = true)]
 fn unitree_webrtc_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing()?;
     debug!(
@@ -116,6 +117,7 @@ fn unitree_webrtc_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_constants(_py, m)?;
 
     let driver_module = PyModule::new(_py, "webrtc_driver")?;
+    driver_module.gil_used(true)?;
     driver_module.add_class::<interface::bridges::PyUnitreeWebRTCConnection>()?;
     driver_module.add_class::<interface::bridges::PyWebRTCConnectionMethod>()?;
     driver_module.add_class::<interface::bridges::PyVuiColor>()?;

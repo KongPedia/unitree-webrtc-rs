@@ -1,6 +1,6 @@
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyDict, PyList};
+use pyo3::types::{PyAny, PyBool, PyDict, PyInt, PyList, PyString};
 use serde_json::{Map, Number, Value};
 use std::collections::HashSet;
 
@@ -15,16 +15,64 @@ pub(crate) async fn with_session_owner<T>(
 
 // Bound container nesting, not scalar leaves, before recursive conversion.
 const MAX_JSON_DEPTH: usize = 64;
+// Conversion policy, not wire limits: charge expanded values and copied UTF-8/key storage.
+const MAX_JSON_NODES: usize = 16_384;
+const MAX_JSON_BYTES: usize = 1024 * 1024;
+
+struct JsonBudget {
+    remaining_nodes: usize,
+    remaining_bytes: usize,
+}
+
+impl JsonBudget {
+    fn charge_node(&mut self) -> PyResult<()> {
+        self.remaining_nodes = self
+            .remaining_nodes
+            .checked_sub(1)
+            .ok_or_else(|| PyValueError::new_err("JSON node budget exceeded"))?;
+        self.charge_bytes(std::mem::size_of::<Value>())
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> PyResult<()> {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| PyValueError::new_err("JSON byte budget exceeded"))?;
+        Ok(())
+    }
+
+    fn check_children(&self, count: usize) -> PyResult<()> {
+        if count > self.remaining_nodes {
+            return Err(PyValueError::new_err("JSON node budget exceeded"));
+        }
+        if count > self.remaining_bytes / std::mem::size_of::<Value>() {
+            return Err(PyValueError::new_err("JSON byte budget exceeded"));
+        }
+        Ok(())
+    }
+
+    fn copy_string(&mut self, object: &Bound<'_, PyAny>) -> PyResult<String> {
+        let text = object.cast::<PyString>()?.to_str()?;
+        self.charge_bytes(text.len())?;
+        Ok(text.to_owned())
+    }
+}
 
 pub fn py_any_to_json_value(object: &Bound<'_, PyAny>) -> PyResult<Value> {
-    convert_json(object, 0, &mut HashSet::new())
+    let mut budget = JsonBudget {
+        remaining_nodes: MAX_JSON_NODES,
+        remaining_bytes: MAX_JSON_BYTES,
+    };
+    convert_json(object, 0, &mut HashSet::new(), &mut budget)
 }
 
 fn convert_json(
     object: &Bound<'_, PyAny>,
     depth: usize,
     active_containers: &mut HashSet<usize>,
+    budget: &mut JsonBudget,
 ) -> PyResult<Value> {
+    budget.charge_node()?;
     if object.is_none() {
         return Ok(Value::Null);
     }
@@ -34,13 +82,21 @@ fn convert_json(
     if let Ok(v) = object.extract::<i64>() {
         return Ok(Value::Number(Number::from(v)));
     }
+    if let Ok(v) = object.extract::<u64>() {
+        return Ok(Value::Number(Number::from(v)));
+    }
+    if object.is_instance_of::<PyInt>() {
+        return Err(PyValueError::new_err(
+            "JSON integer must fit signed or unsigned 64-bit range",
+        ));
+    }
     if let Ok(v) = object.extract::<f64>() {
         return Number::from_f64(v)
             .map(Value::Number)
             .ok_or_else(|| PyValueError::new_err("JSON numbers must be finite"));
     }
-    if let Ok(v) = object.extract::<String>() {
-        return Ok(Value::String(v));
+    if object.is_instance_of::<PyString>() {
+        return budget.copy_string(object).map(Value::String);
     }
 
     let list = object.cast_exact::<PyList>().ok();
@@ -58,21 +114,25 @@ fn convert_json(
 
     // Track only the current path: repeated shared containers are valid JSON.
     let result = match (list, dict) {
-        (Some(list), _) => list
-            .iter()
-            .map(|item| convert_json(&item, depth + 1, active_containers))
-            .collect::<PyResult<Vec<_>>>()
-            .map(Value::Array),
-        (_, Some(dict)) => dict
-            .iter()
-            .map(|(key, value)| {
-                Ok((
-                    key.extract::<String>()?,
-                    convert_json(&value, depth + 1, active_containers)?,
-                ))
-            })
-            .collect::<PyResult<Map<_, _>>>()
-            .map(Value::Object),
+        (Some(list), _) => {
+            budget.check_children(list.len())?;
+            let mut values = Vec::new();
+            for item in list.iter() {
+                values.push(convert_json(&item, depth + 1, active_containers, budget)?);
+            }
+            Ok(Value::Array(values))
+        }
+        (_, Some(dict)) => {
+            budget.check_children(dict.len())?;
+            let mut values = Map::new();
+            for (key, value) in dict.iter() {
+                budget.charge_bytes(std::mem::size_of::<String>())?;
+                let key = budget.copy_string(&key)?;
+                let value = convert_json(&value, depth + 1, active_containers, budget)?;
+                values.insert(key, value);
+            }
+            Ok(Value::Object(values))
+        }
         _ => unreachable!("container type checked above"),
     };
     active_containers.remove(&identity);
@@ -93,6 +153,8 @@ pub fn json_value_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i.into_pyobject(py)?.into_any().unbind())
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.into_pyobject(py)?.into_any().unbind())
             } else if let Some(f) = n.as_f64() {
                 Ok(f.into_pyobject(py)?.into_any().unbind())
             } else {
@@ -130,6 +192,59 @@ pub fn to_py_error(error: String) -> PyErr {
 mod tests {
     use super::*;
     use pyo3::exceptions::PyValueError;
+
+    #[test]
+    fn python_unsigned_integers_keep_exact_json_values() {
+        Python::initialize();
+        Python::attach(|py| {
+            for value in [
+                9_007_199_254_740_993u64,
+                9_223_372_036_854_775_809,
+                u64::MAX,
+            ] {
+                let object = value.into_pyobject(py).unwrap();
+                assert_eq!(
+                    py_any_to_json_value(object.as_any()).unwrap().as_u64(),
+                    Some(value)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn json_unsigned_integers_return_exact_python_integers() {
+        Python::initialize();
+        Python::attach(|py| {
+            for value in [
+                9_007_199_254_740_993u64,
+                9_223_372_036_854_775_809,
+                u64::MAX,
+            ] {
+                let object = json_value_to_py(py, &Value::from(value)).unwrap();
+                assert!(object.bind(py).is_instance_of::<pyo3::types::PyInt>());
+                assert_eq!(object.extract::<u64>(py).unwrap(), value);
+            }
+        });
+    }
+
+    #[test]
+    fn signed_integer_extremes_keep_exact_values_in_both_directions() {
+        Python::initialize();
+        Python::attach(|py| {
+            for value in [i64::MIN, i64::MAX] {
+                let object = value.into_pyobject(py).unwrap();
+                let json = py_any_to_json_value(object.as_any()).unwrap();
+                assert_eq!(json.as_i64(), Some(value));
+                assert_eq!(
+                    json_value_to_py(py, &json)
+                        .unwrap()
+                        .extract::<i64>(py)
+                        .unwrap(),
+                    value
+                );
+            }
+        });
+    }
 
     #[test]
     fn rejects_nonfinite_numbers_and_excessive_depth() {

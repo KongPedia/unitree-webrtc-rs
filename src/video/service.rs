@@ -59,7 +59,11 @@ pub fn spawn_video_handler(
             match packet {
                 Ok((rtp_packet, _attributes)) => {
                     // Zero-copy: borrow payload directly instead of to_vec()
-                    if let Some(nal_data) = reassembler.process_packet(&rtp_packet.payload) {
+                    if let Some(nal_data) = reassembler.process_rtp_packet(
+                        &rtp_packet.payload,
+                        rtp_packet.header.sequence_number,
+                        rtp_packet.header.timestamp,
+                    ) {
                         match decoder.decode(&nal_data) {
                             Ok(Some(decoded_frame)) => {
                                 frame_count += 1;

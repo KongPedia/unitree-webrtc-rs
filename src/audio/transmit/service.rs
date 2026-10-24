@@ -66,6 +66,7 @@ pub struct AudioSender {
     task_handle: Option<tokio::task::JoinHandle<()>>,
     bus_handle: Option<thread::JoinHandle<()>>,
     rtp_tx: Option<mpsc::Sender<Bytes>>,
+    native_shutdown: bool,
 }
 
 impl AudioSender {
@@ -266,6 +267,7 @@ impl AudioSender {
             task_handle: Some(task_handle),
             bus_handle,
             rtp_tx: Some(rtp_tx),
+            native_shutdown: false,
         })
     }
 
@@ -291,35 +293,35 @@ impl AudioSender {
         Ok(())
     }
 
+    /// Synchronously stop the native pipeline and join its bus worker.
+    /// Async session callers use owned shutdown so this never blocks Tokio.
     pub fn stop(&mut self) -> Result<(), String> {
-        info!(event = "audio_sender_stop", "Stopping audio playback");
+        self.take_native_shutdown()
+            .map_or(Ok(()), NativeAudioShutdown::stop)
+    }
 
+    fn take_native_shutdown(&mut self) -> Option<NativeAudioShutdown> {
         self.is_playing.store(false, Ordering::Relaxed);
         self.bus_running.store(false, Ordering::Relaxed);
-
-        // Close RTP channel to stop async task
         drop(self.rtp_tx.take());
-
-        // Abort async task if running
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
+        if let Some(task) = &self.task_handle {
+            task.abort();
         }
-
-        self.pipeline
-            .set_state(gst::State::Null)
-            .map_err(|e| format!("Failed to stop pipeline: {e:?}"))?;
-
-        if let Some(handle) = self.bus_handle.take() {
-            let _ = handle.join();
+        if self.native_shutdown {
+            return None;
         }
+        self.native_shutdown = true;
+        Some(NativeAudioShutdown {
+            pipeline: self.pipeline.clone(),
+            bus_handle: self.bus_handle.take(),
+            packet_count: Arc::clone(&self.packet_count),
+        })
+    }
 
-        info!(
-            event = "audio_sender_stop_stats",
-            total_packets = self.packet_count.load(Ordering::Relaxed),
-            "Audio sender stop stats"
-        );
-
-        Ok(())
+    pub(crate) async fn shutdown(mut self) -> Result<(), String> {
+        let native = self.take_native_shutdown();
+        let task = self.task_handle.take();
+        complete_audio_shutdown(native, task).await
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -337,21 +339,84 @@ impl AudioSender {
     }
 }
 
+struct NativeAudioShutdown {
+    pipeline: gst::Pipeline,
+    bus_handle: Option<thread::JoinHandle<()>>,
+    packet_count: Arc<AtomicU64>,
+}
+
+impl NativeAudioShutdown {
+    fn stop(self) -> Result<(), String> {
+        info!(event = "audio_sender_stop", "Stopping audio playback");
+        let pipeline_result = self
+            .pipeline
+            .set_state(gst::State::Null)
+            .map(|_| ())
+            .map_err(|_| "Failed to stop audio pipeline".to_string());
+        let result = join_audio_bus(pipeline_result, self.bus_handle);
+        info!(
+            event = "audio_sender_stop_stats",
+            total_packets = self.packet_count.load(Ordering::Relaxed),
+            "Audio sender stop stats"
+        );
+        result
+    }
+}
+
+fn join_audio_bus(
+    pipeline_result: Result<(), String>,
+    bus_handle: Option<thread::JoinHandle<()>>,
+) -> Result<(), String> {
+    // A state failure must not skip joining the other owned worker.
+    let bus_result = bus_handle.map_or(Ok(()), |handle| {
+        handle
+            .join()
+            .map_err(|_| "Audio bus worker failed".to_string())
+    });
+    pipeline_result.and(bus_result)
+}
+
+async fn complete_audio_shutdown(
+    native: Option<NativeAudioShutdown>,
+    task: Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), String> {
+    let native_result = match native {
+        Some(native) => tokio::task::spawn_blocking(move || native.stop())
+            .await
+            .unwrap_or_else(|_| Err("Audio cleanup worker failed".into())),
+        None => Ok(()),
+    };
+    let task_result = match task {
+        Some(task) => match task.await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err("Audio RTP worker failed".to_string()),
+        },
+        None => Ok(()),
+    };
+    native_result.and(task_result)
+}
+
 impl Drop for AudioSender {
     fn drop(&mut self) {
-        self.bus_running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
+        let native = self.take_native_shutdown();
+        let task = self.task_handle.take();
+        if native.is_none() && task.is_none() {
+            return;
         }
-        drop(self.rtp_tx.take());
-        if self.pipeline.set_state(gst::State::Null).is_err() {
-            error!(
-                event = "audio_sender_drop_failed",
-                "Failed to stop audio sender pipeline on drop"
-            );
-        }
-        if let Some(handle) = self.bus_handle.take() {
-            let _ = handle.join();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Final drop is best effort; the owner task still observes both joins.
+            // Session operations retain this completion separately across cancellation.
+            runtime.spawn(async move {
+                if complete_audio_shutdown(native, task).await.is_err() {
+                    error!(event = "audio_sender_drop_failed", "Audio cleanup failed");
+                }
+            });
+        } else if let Some(native) = native {
+            // Without a live runtime only native teardown can be synchronous.
+            if native.stop().is_err() {
+                error!(event = "audio_sender_drop_failed", "Audio cleanup failed");
+            }
         }
     }
 }
@@ -430,6 +495,86 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn sender_final_drop_keeps_the_executor_live_and_finishes_workers() {
+        let delayed = test_support::delayed_audio().await;
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = delayed.release.send(());
+        });
+        drop(delayed.sender);
+        timer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !delayed.native_joined.load(Ordering::SeqCst)
+                || !delayed.rtp_completed.load(Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final audio drop must finish both owned workers");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipeline_stop_failure_still_joins_the_native_bus() {
+        let (release, resume) = std::sync::mpsc::channel();
+        let joined = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&joined);
+        let bus = thread::spawn(move || {
+            if resume.recv_timeout(Duration::from_secs(1)).is_ok() {
+                completed.store(true, Ordering::SeqCst);
+            }
+        });
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut cleanup = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            join_audio_bus(Err("controlled pipeline stop failure".into()), Some(bus))
+        });
+        ready.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut cleanup)
+                .await
+                .is_err(),
+            "pipeline failure skipped the native join"
+        );
+        release.send(()).unwrap();
+        assert!(cleanup.await.unwrap().is_err());
+        assert!(joined.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_does_not_return_before_the_aborted_rtp_worker_completes() {
+        let mut delayed = test_support::delayed_audio().await;
+        let old = delayed.sender.task_handle.take().unwrap();
+        old.abort();
+        old.await.unwrap_err();
+        let (release, resume) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        // A started blocking handle cannot be forcibly canceled. This controlled
+        // worker makes dropping an aborted JoinHandle observably wrong.
+        delayed.sender.task_handle = Some(tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            if resume.recv_timeout(Duration::from_secs(1)).is_ok() {
+                worker_completed.store(true, Ordering::SeqCst);
+            }
+        }));
+        ready.await.unwrap();
+        delayed.release.send(()).unwrap();
+        let mut cleanup = tokio::spawn(delayed.sender.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut cleanup)
+                .await
+                .is_err(),
+            "shutdown detached the aborted RTP worker"
+        );
+        release.send(()).unwrap();
+        cleanup.await.unwrap().unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(delayed.native_joined.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn source_rejects_invalid_and_unavailable_uri_schemes() {
         ensure_gst_init().unwrap();
@@ -445,5 +590,67 @@ mod tests {
                 .to_uri()
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct DelayedAudio {
+        pub sender: AudioSender,
+        pub release: std::sync::mpsc::Sender<()>,
+        pub native_joined: Arc<AtomicBool>,
+        pub rtp_completed: Arc<AtomicBool>,
+        pub bus_running: Arc<AtomicBool>,
+    }
+
+    pub(crate) async fn delayed_audio() -> DelayedAudio {
+        ensure_gst_init().unwrap();
+        let (release, resume) = std::sync::mpsc::channel();
+        let native_joined = Arc::new(AtomicBool::new(false));
+        let joined = Arc::clone(&native_joined);
+        let bus_handle = thread::spawn(move || {
+            // A watchdog bounds broken synchronous cleanup; success requires the
+            // Tokio timer/explicit test barrier to release this worker first.
+            joined.store(
+                resume.recv_timeout(Duration::from_secs(1)).is_ok(),
+                Ordering::SeqCst,
+            );
+        });
+        struct Complete(Arc<AtomicBool>);
+        impl Drop for Complete {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let rtp_completed = Arc::new(AtomicBool::new(false));
+        let completed = Complete(Arc::clone(&rtp_completed));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task_handle = tokio::spawn(async move {
+            let _completed = completed;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        let bus_running = Arc::new(AtomicBool::new(true));
+        let sender = AudioSender {
+            pipeline: gst::Pipeline::new(),
+            is_playing: Arc::new(AtomicBool::new(true)),
+            bus_running: Arc::clone(&bus_running),
+            packet_count: Arc::new(AtomicU64::new(0)),
+            source_type: AudioSource::File("offline".into()),
+            task_handle: Some(task_handle),
+            bus_handle: Some(bus_handle),
+            rtp_tx: None,
+            native_shutdown: false,
+        };
+        DelayedAudio {
+            sender,
+            release,
+            native_joined,
+            rtp_completed,
+            bus_running,
+        }
     }
 }

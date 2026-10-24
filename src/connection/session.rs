@@ -1,5 +1,8 @@
 //! Language-neutral owner of one validated WebRTC session and its bounded resources.
-use super::lifecycle::{connect_validated_session, disconnect_session, SessionConnect};
+use super::lifecycle::{
+    connect_validated_session, disconnect_session, stop_audio_sender, AudioOperation,
+    AudioPlayback, SessionConnect,
+};
 use super::ConnectionService;
 use crate::audio::transmit::service::AudioSource;
 use crate::audio::AudioSender;
@@ -90,7 +93,7 @@ where
     service: Arc<ConnectionService<S, E>>,
     engine: Arc<E>,
     datachannel: Arc<DataChannelService<E>>,
-    audio_sender: Arc<AsyncMutex<Option<AudioSender>>>,
+    audio_sender: Arc<AsyncMutex<AudioPlayback>>,
     validation_timeout: Duration,
     cleanup_runtime: Mutex<Option<tokio::runtime::Handle>>,
 }
@@ -102,6 +105,10 @@ where
 {
     /// Assemble the same queues, routing and lifecycle for real or offline adapters.
     /// Adapter factory receives the bounded ingress and callback-event producers.
+    ///
+    /// # Errors
+    /// Returns invalid resource options or a sanitized worker/router startup failure.
+    /// Partially started idle LiDAR workers finish before an error is returned.
     pub fn with_adapters<F>(
         options: SessionOptions,
         signaling: Arc<S>,
@@ -110,33 +117,61 @@ where
     where
         F: FnOnce(Sender<IngressMessage>, EventSender) -> Arc<E>,
     {
+        Self::with_adapters_and_spawner(options, signaling, create_engine, &mut |builder, job| {
+            builder.spawn(job)
+        })
+    }
+
+    fn with_adapters_and_spawner<F, W>(
+        options: SessionOptions,
+        signaling: Arc<S>,
+        create_engine: F,
+        spawn: &mut W,
+    ) -> PortResult<(Self, EventReceiver)>
+    where
+        F: FnOnce(Sender<IngressMessage>, EventSender) -> Arc<E>,
+        W: FnMut(
+            std::thread::Builder,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    {
         options.validate()?;
         let (incoming_tx, incoming_rx) = bounded(options.incoming_capacity);
         let (events_tx, events_rx) = event_channel(options.event_capacity)?;
         let engine = create_engine(incoming_tx, events_tx.clone());
-        let workers = Arc::new(LidarWorkerPool::new(
-            events_tx.clone(),
-            options.lidar_workers,
-        ));
+        let (workers, worker_handles) =
+            LidarWorkerPool::try_new_with_spawner(events_tx.clone(), options.lidar_workers, spawn)?;
+        let workers = Arc::new(workers);
         let service = Arc::new(ConnectionService::new(
             signaling,
             engine.clone(),
             options.connection_method,
             options.ip,
         ));
-        let datachannel = Arc::new(DataChannelService::new(
+        let datachannel = DataChannelService::try_new_with_spawner(
             engine.clone(),
             incoming_rx,
             events_tx,
             workers,
             options.connection_method == WebRTCConnectionMethod::Remote,
-        ));
+            spawn,
+        );
+        let datachannel = match datachannel {
+            Ok(datachannel) => Arc::new(datachannel),
+            Err(error) => {
+                // The failed router released its pool; no jobs exist before assembly completes.
+                for worker in worker_handles {
+                    let _ = worker.join();
+                }
+                return Err(error);
+            }
+        };
         Ok((
             Self {
                 service,
                 engine,
                 datachannel,
-                audio_sender: Arc::new(AsyncMutex::new(None)),
+                audio_sender: Arc::new(AsyncMutex::new(AudioPlayback::default())),
                 validation_timeout: options.validation_timeout,
                 cleanup_runtime: Mutex::new(None),
             },
@@ -238,9 +273,12 @@ impl UnitreeSession {
     /// Replace playback under the same gate as connect/reconnect/disconnect.
     pub async fn play_audio(&self, source: AudioSource) -> PortResult<()> {
         self.remember_runtime();
-        let _gate = self.service.lock_session().await;
+        let operation = AudioOperation::new(
+            self.service.lock_session().await,
+            Arc::clone(&self.audio_sender),
+        );
         let result = async {
-            *self.audio_sender.lock().await = None;
+            stop_audio_sender(&self.audio_sender).await?;
             if !self.is_connected() {
                 return Err("Audio track not initialized. Call connect() first.".into());
             }
@@ -248,24 +286,29 @@ impl UnitreeSession {
                 self.engine.get_audio_track().await.ok_or_else(|| {
                     "Audio track not initialized. Call connect() first.".to_string()
                 })?;
-            let sender = AudioSender::new(source, track)?;
-            sender.play()?;
-            *self.audio_sender.lock().await = Some(sender);
-            Ok(())
+            let result = {
+                let mut playback = self.audio_sender.lock().await;
+                let sender = AudioSender::new(source, track)?;
+                playback.play(sender)
+            };
+            if result.is_err() {
+                let _ = stop_audio_sender(&self.audio_sender).await;
+            }
+            result
         }
         .await;
+        operation.finish();
         result
     }
 
     pub async fn stop_audio(&self) -> PortResult<()> {
         self.remember_runtime();
-        let _gate = self.service.lock_session().await;
-        let result = self
-            .audio_sender
-            .lock()
-            .await
-            .take()
-            .map_or(Ok(()), |mut sender| sender.stop());
+        let operation = AudioOperation::new(
+            self.service.lock_session().await,
+            Arc::clone(&self.audio_sender),
+        );
+        let result = stop_audio_sender(&self.audio_sender).await;
+        operation.finish();
         result
     }
 }
@@ -277,14 +320,210 @@ where
 {
     fn drop(&mut self) {
         self.datachannel.stop_background_tasks();
-        if let Ok(mut sender) = self.audio_sender.try_lock() {
-            *sender = None;
-        }
         if let Some(runtime) = self.cleanup_runtime.lock().unwrap().take() {
             let service = Arc::clone(&self.service);
+            let datachannel = Arc::clone(&self.datachannel);
+            let audio = Arc::clone(&self.audio_sender);
             runtime.spawn(async move {
-                service.disconnect().await;
+                disconnect_session(&service, &datachannel, &audio).await;
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_lifecycle_tests {
+    use super::*;
+    use crate::audio::transmit::service::test_support::delayed_audio;
+    use std::sync::atomic::Ordering;
+
+    fn offline_session() -> UnitreeSession {
+        UnitreeSession::new(
+            SessionOptions::new(WebRTCConnectionMethod::LocalAP, None),
+            None,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_audio_allows_timer_progress_and_observes_all_worker_completion() {
+        let session = offline_session();
+        let delayed = delayed_audio().await;
+        session.audio_sender.lock().await.sender = Some(delayed.sender);
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = delayed.release.send(());
+        });
+        session.stop_audio().await.unwrap();
+        timer.await.unwrap();
+        assert!(
+            delayed.native_joined.load(Ordering::SeqCst),
+            "native join blocked the Tokio timer"
+        );
+        assert!(
+            delayed.rtp_completed.load(Ordering::SeqCst),
+            "stop returned before RTP task completion"
+        );
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum CleanupBoundary {
+        Stop,
+        Replace,
+        Disconnect,
+        Drop,
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_disconnect_and_final_drop_keep_the_executor_live() {
+        for boundary in [
+            CleanupBoundary::Replace,
+            CleanupBoundary::Disconnect,
+            CleanupBoundary::Drop,
+        ] {
+            let session = offline_session();
+            session.remember_runtime();
+            let delayed = delayed_audio().await;
+            session.audio_sender.lock().await.sender = Some(delayed.sender);
+            let timer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let _ = delayed.release.send(());
+            });
+            match boundary {
+                CleanupBoundary::Replace => {
+                    assert!(session
+                        .play_audio(AudioSource::File("offline-not-opened".into()))
+                        .await
+                        .is_err());
+                }
+                CleanupBoundary::Disconnect => session.disconnect().await,
+                CleanupBoundary::Drop => drop(session),
+                CleanupBoundary::Stop => unreachable!(),
+            }
+            timer.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !delayed.native_joined.load(Ordering::SeqCst)
+                    || !delayed.rtp_completed.load(Ordering::SeqCst)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{boundary:?} did not observe both workers"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_audio_waiters_retain_the_gate_until_both_workers_finish() {
+        for boundary in [
+            CleanupBoundary::Stop,
+            CleanupBoundary::Replace,
+            CleanupBoundary::Disconnect,
+        ] {
+            let session = Arc::new(offline_session());
+            let delayed = delayed_audio().await;
+            session.audio_sender.lock().await.sender = Some(delayed.sender);
+            let waiter = {
+                let session = Arc::clone(&session);
+                tokio::spawn(async move {
+                    match boundary {
+                        CleanupBoundary::Stop => session.stop_audio().await,
+                        CleanupBoundary::Replace => {
+                            session
+                                .play_audio(AudioSource::File("offline-not-opened".into()))
+                                .await
+                        }
+                        CleanupBoundary::Disconnect => {
+                            session.disconnect().await;
+                            Ok(())
+                        }
+                        CleanupBoundary::Drop => unreachable!(),
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while delayed.bus_running.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            let next_epoch_gate = session.service.lock_session();
+            tokio::pin!(next_epoch_gate);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut next_epoch_gate)
+                    .await
+                    .is_err(),
+                "{boundary:?} cancellation released the session gate before native cleanup"
+            );
+            delayed.release.send(()).unwrap();
+            let gate = tokio::time::timeout(Duration::from_secs(1), next_epoch_gate)
+                .await
+                .unwrap();
+            assert!(delayed.native_joined.load(Ordering::SeqCst));
+            assert!(delayed.rtp_completed.load(Ordering::SeqCst));
+            drop(gate);
+        }
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn construction_returns_error_and_releases_workers_and_adapters_at_each_spawn_failure() {
+        for fail_at in 0..=2 {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let mut attempts = 0;
+            let mut weak_engine = None;
+            let mut options = SessionOptions::new(WebRTCConnectionMethod::LocalAP, None);
+            options.lidar_workers = 2;
+            let result = UnitreeSession::with_adapters_and_spawner(
+                options,
+                Arc::new(HttpSignalingClient::new(None)),
+                |incoming, events| {
+                    let engine = Arc::new(RtcEngine::new(incoming, events));
+                    weak_engine = Some(Arc::downgrade(&engine));
+                    engine
+                },
+                &mut |builder, job| {
+                    let attempt = attempts;
+                    attempts += 1;
+                    if attempt == fail_at {
+                        return Err(std::io::Error::other("secret OS error detail"));
+                    }
+                    let completed = Arc::clone(&completed);
+                    builder.spawn(move || {
+                        job();
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    })
+                },
+            );
+            let error = result
+                .err()
+                .expect("construction must return a recoverable error");
+            assert!(!error.contains("secret"));
+            assert_eq!(attempts, fail_at + 1);
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                fail_at,
+                "already started idle workers must complete before returning Err"
+            );
+            assert!(
+                weak_engine.unwrap().upgrade().is_none(),
+                "adapter leaked on failure"
+            );
+            let (session, events) = UnitreeSession::new(
+                SessionOptions::new(WebRTCConnectionMethod::LocalAP, None),
+                None,
+            )
+            .expect("a failed construction must not poison subsequent sessions");
+            assert!(!session.is_connected());
+            drop((session, events));
         }
     }
 }

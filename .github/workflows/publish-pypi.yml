@@ -3,110 +3,42 @@ name: Build and Publish to PyPI
 on:
   push:
     tags:
-      - "v*.*.*" # Trigger on version tags (e.g., v0.1.0, v1.2.3)
-  workflow_dispatch: # Allow manual trigger
+      - "v*.*.*"
+  workflow_dispatch: # Production release from the selected ref; not a TestPyPI dry run.
 
 permissions:
   contents: read
 
+# Do not interrupt an in-progress upload with another release from the same ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-wheels:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-14] # macos-14 for Apple Silicon
-        python-version: ["3.10", "3.11", "3.12"]
-
+  release-metadata:
+    name: Verify release identity before building
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          version: "latest"
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
+      - name: Match pushed tag to manifests and locks
+        if: github.event_name == 'push'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/check-release.py --tag "$RELEASE_TAG"
+      - name: Validate manual release from selected ref (no tag required)
+        if: github.event_name == 'workflow_dispatch'
+        run: python scripts/check-release.py
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --fix-broken \
-            libunwind-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-tools \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-libav \
-            libopus-dev \
-            pkg-config
-
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install gstreamer opus pkg-config
-
-      - name: Verify required runtime media plugins
-        run: |
-          for element in appsrc appsink h264parse avdec_h264 videoconvert uridecodebin audioconvert audioresample opusenc rtpopuspay; do
-            gst-inspect-1.0 --exists "$element"
-          done
-
-      - name: Sync uv dependencies
-        run: uv sync --locked --dev --no-install-project --python "${{ matrix.python-version }}"
-
-      - name: Identify Python ABI and Rust toolchain for build cache
-        id: build-cache
-        run: |
-          uv run --locked --no-sync python -c 'import platform, sysconfig; print("python=" + platform.python_version() + "-" + sysconfig.get_config_var("SOABI"))' >> "$GITHUB_OUTPUT"
-          echo "rust=$(rustc -vV | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-downloads-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-downloads-v2-
-
-      - name: Cache Rust build outputs
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ runner.arch }}-target-v2-${{ steps.build-cache.outputs.python }}-${{ steps.build-cache.outputs.rust }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-target-v2-${{ steps.build-cache.outputs.python }}-${{ steps.build-cache.outputs.rust }}-
-
-      - name: Offline acceptance (Rust, core and freshly built native Python)
-        run: make acceptance
-
-      - name: Build wheels with maturin
-        run: |
-          uv run --locked --no-sync maturin build --release --out dist --locked
-
-      - name: Fresh wheel import outside repository
-        run: |
-          for wheel in dist/*.whl; do
-            uv run --locked --no-sync python scripts/smoke-wheel.py "$wheel"
-          done
-
-      - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
-          path: dist/*.whl
-          retention-days: 7
+  build-wheels:
+    needs: release-metadata
+    uses: ./.github/workflows/acceptance.yml
+    with:
+      build-wheel: true
 
   publish-pypi:
     name: Publish to PyPI
@@ -116,11 +48,11 @@ jobs:
       name: pypi
       url: https://pypi.org/p/unitree-webrtc-rs
     permissions:
-      id-token: write # Required for trusted publishing
+      id-token: write # Existing policy; API token publication below is unchanged.
 
     steps:
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: wheels-*
           path: dist
@@ -130,9 +62,8 @@ jobs:
         run: ls -lah dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: dist/
           attestations: false
-          # Use PyPI API token from GitHub secrets
           password: ${{ secrets.PYPI_API_TOKEN }}

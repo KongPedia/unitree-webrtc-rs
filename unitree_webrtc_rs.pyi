@@ -67,9 +67,7 @@ class PubSubBridge:
             Response dictionary
         """
 
-    def publish_without_callback(
-        self, topic: str, data: Any = None, msg_type: str | None = None
-    ) -> None:
+    def publish_without_callback(self, topic: str, data: Any = None, msg_type: str | None = None) -> None:
         """Publish a message without waiting for response.
 
         Args:
@@ -133,22 +131,22 @@ class AudioBridge:
             callback: Function receiving PCM samples as numpy array
         """
 
-    def play_from_file(self, path: str) -> Awaitable[None]:
+    def play_from_file(self, path: str) -> Awaitable[tuple[()]]:
         """Play audio from file through WebRTC.
 
         Args:
             path: Path to audio file
         """
 
-    def play_from_url(self, url: str) -> Awaitable[None]:
+    def play_from_url(self, url: str) -> Awaitable[tuple[()]]:
         """Play audio from URL through WebRTC.
 
         Args:
             url: Audio stream URL
         """
 
-    def stop(self) -> Awaitable[None]:
-        """Stop audio playback."""
+    def stop(self) -> Awaitable[tuple[()]]:
+        """Stop audio playback; resolves to ``()``."""
 
 class DataChannelBridge:
     """DataChannel control bridge.
@@ -252,17 +250,26 @@ class UnitreeWebRTCConnection:
             **kwargs: Additional connection parameters
         """
 
-    def connect(self) -> Awaitable[None]:
+    def connect(self) -> Awaitable[tuple[()]]:
         """Establish WebRTC connection to robot.
 
         Raises:
             RuntimeError: If connection fails
         """
 
-    def disconnect(self) -> Awaitable[None]:
-        """Disconnect from robot and cleanup resources."""
+    def disconnect(self) -> Awaitable[tuple[()]]:
+        """Disconnect transport, retaining callbacks for reuse; resolves to ``()``."""
 
-    def reconnect(self) -> Awaitable[None]:
+    def clear_callbacks(self) -> None:
+        """Release the current Python callback registrations synchronously.
+
+        Does not disconnect, unsubscribe remote topics or disable media. An
+        callback already copied for dispatch may still run; a finalizer may register another
+        callback. Later registrations are allowed. For final cleanup, call this
+        explicitly, await ``disconnect()``, then release the connection/bridges.
+        """
+
+    def reconnect(self) -> Awaitable[tuple[()]]:
         """Reconnect to robot after disconnection.
 
         Raises:

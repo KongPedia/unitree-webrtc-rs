@@ -3,7 +3,7 @@ use crate::interface::bridges::audio::PyAudioBridge;
 use crate::interface::bridges::datachannel::PyDataChannelBridge;
 use crate::interface::bridges::pubsub::CallbackRegistry;
 use crate::interface::bridges::video::PyVideoBridge;
-use crate::interface::callbacks::spawn_callback_dispatcher;
+use crate::interface::callbacks::{clear_callback_registry, try_spawn_callback_dispatcher_with};
 use crate::interface::utils::to_py_error;
 use crate::protocol::constants::WebRTCConnectionMethod;
 use pyo3::exceptions::PyValueError;
@@ -38,6 +38,24 @@ pub struct PyUnitreeWebRTCConnection {
     _aes_128_key: Option<String>,
     session: Arc<UnitreeSession>,
     callback_registry: CallbackRegistry,
+}
+
+impl PyUnitreeWebRTCConnection {
+    fn start_callback_dispatcher<F>(
+        self,
+        events: crate::protocol::events::EventReceiver,
+        spawn: F,
+    ) -> PyResult<Self>
+    where
+        F: FnOnce(
+            std::thread::Builder,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    {
+        try_spawn_callback_dispatcher_with(events, Arc::clone(&self.callback_registry), spawn)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok(self)
+    }
 }
 
 #[pymethods]
@@ -86,9 +104,7 @@ impl PyUnitreeWebRTCConnection {
         )
         .map_err(to_py_error)?;
         let callback_registry: CallbackRegistry = Arc::new(Mutex::new(HashMap::new()));
-        spawn_callback_dispatcher(callback_events_rx, Arc::clone(&callback_registry));
-
-        Ok(Self {
+        Self {
             connection_method,
             serial_number: resolved_serial,
             ip,
@@ -97,7 +113,8 @@ impl PyUnitreeWebRTCConnection {
             _aes_128_key: resolved_aes_128_key,
             session: Arc::new(session),
             callback_registry,
-        })
+        }
+        .start_callback_dispatcher(callback_events_rx, |builder, job| builder.spawn(job))
     }
 
     fn connect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -113,6 +130,14 @@ impl PyUnitreeWebRTCConnection {
             session.disconnect().await;
             Ok(())
         })
+    }
+
+    /// Release registered Python callbacks without disconnecting or changing remote subscriptions.
+    ///
+    /// Callbacks already copied for dispatch may still run. Finalizers may register new callbacks;
+    /// later registration is supported. Disconnect/reconnect retain registrations unless cleared.
+    fn clear_callbacks(&self, py: Python<'_>) -> PyResult<()> {
+        clear_callback_registry(py, &self.callback_registry)
     }
 
     fn reconnect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -213,6 +238,65 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_failure_returns_python_error_and_releases_owner_and_registry() {
+        Python::initialize();
+        let (session, events) = UnitreeSession::new(
+            SessionOptions::new(WebRTCConnectionMethod::LocalAP, None),
+            None,
+        )
+        .unwrap();
+        let session = Arc::new(session);
+        let callback_registry = Arc::new(Mutex::new(HashMap::new()));
+        let weak_session = Arc::downgrade(&session);
+        let weak_registry = Arc::downgrade(&callback_registry);
+        let captured_session = Arc::clone(&session);
+        Python::attach(|py| {
+            let callback = pyo3::types::PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |_, _| -> PyResult<()> {
+                    let _keep_session_alive = &captured_session;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            callback_registry.lock().unwrap().insert(
+                "captured-session".into(),
+                callback.into_any().unbind().into(),
+            );
+        });
+        let connection = PyUnitreeWebRTCConnection {
+            connection_method: WebRTCConnectionMethod::LocalAP,
+            serial_number: None,
+            ip: None,
+            _username: None,
+            _password: None,
+            _aes_128_key: None,
+            session,
+            callback_registry,
+        };
+        let error = connection
+            .start_callback_dispatcher(events, |_, _| {
+                Err(std::io::Error::other("secret OS error detail"))
+            })
+            .err()
+            .expect("dispatcher failure must return an error");
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(!error.to_string().contains("secret"));
+        });
+        assert!(
+            weak_session.upgrade().is_none(),
+            "failed binding retained session"
+        );
+        assert!(
+            weak_registry.upgrade().is_none(),
+            "failed dispatcher retained registry"
+        );
+    }
+
+    #[test]
     fn resolve_aes_128_key_prefers_explicit_key() {
         let _guard = env_lock().lock().unwrap();
         env::set_var(
@@ -248,6 +332,54 @@ mod tests {
         env::remove_var("GO2_DORA_UNITREE_AES_128_KEY");
         env::remove_var("UNITREE_AES_128_KEY");
     }
+    #[test]
+    fn clearing_callbacks_releases_captured_python_session_owner() {
+        Python::initialize();
+        Python::attach(|py| {
+            for kind in ["bound", "closure"] {
+                let root = py
+                    .get_type::<PyUnitreeWebRTCConnection>()
+                    .call1((1,))
+                    .unwrap();
+                let weak = {
+                    let connection = root
+                        .extract::<PyRef<'_, PyUnitreeWebRTCConnection>>()
+                        .unwrap();
+                    Arc::downgrade(&connection.session)
+                };
+                let globals = PyDict::new(py);
+                globals.set_item("root", &root).unwrap();
+                globals.set_item("kind", kind).unwrap();
+                py.run(
+                    c"import weakref\nclass Owner:\n def __init__(self, root): self.connection=root\n def callback(self, frame): pass\nowner=Owner(root)\nowner_ref=weakref.ref(owner)\ncallback=owner.callback if kind == 'bound' else lambda frame, owner=owner: None\nroot.video.on_frame(callback)\ndel owner, callback, root",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+                assert!(!globals
+                    .get_item("owner_ref")
+                    .unwrap()
+                    .unwrap()
+                    .call0()
+                    .unwrap()
+                    .is_none());
+                root.call_method0("clear_callbacks").unwrap();
+                assert!(globals
+                    .get_item("owner_ref")
+                    .unwrap()
+                    .unwrap()
+                    .call0()
+                    .unwrap()
+                    .is_none());
+                drop(root);
+                assert!(
+                    weak.upgrade().is_none(),
+                    "{kind} retained the session owner"
+                );
+            }
+        });
+    }
+
     #[test]
     fn actual_python_getters_keep_session_alive_until_last_child_drops() {
         Python::initialize();

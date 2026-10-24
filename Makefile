@@ -1,4 +1,4 @@
-.PHONY: help doctor init build test test-rust test-core test-python check check-rust-lint check-guidance acceptance wheel-smoke bootstrap deploy
+.PHONY: help doctor init build test test-rust test-core test-python check check-rust-lint check-guidance check-release benchmark acceptance wheel-smoke bootstrap deploy
 
 # Cargo/PyO3 build scripts share outputs: never race embedded tests with extension builds.
 .NOTPARALLEL:
@@ -17,6 +17,8 @@ help:
 	@echo "  make check      # Run guidance and Rust format/lint/type checks"
 	@echo "  make acceptance # Offline checks/core/Rust/fresh-native tests"
 	@echo "  make check-guidance # Verify pinned guidance metadata/hashes/links"
+	@echo "  make check-release # Verify project versions before packaging"
+	@echo "  make benchmark  # Release-mode offline codec/event measurements"
 	@echo "  make wheel-smoke WHEEL=path.whl # Isolated fresh-wheel import"
 	@echo "  make bootstrap  # Full setup + checks + tests"
 	@echo "  make deploy     # Sync versions and build for release"
@@ -55,9 +57,9 @@ test-core:
 	cargo test --locked --no-default-features
 
 test-python: build
-	@if [ -d tests ]; then uv run --locked --no-sync pytest -q; else echo "No tests directory; skipping pytest."; fi
+	@if [ -d tests ]; then uv run --locked --no-sync pytest -q -c pyproject.toml; else echo "No tests directory; skipping pytest."; fi
 
-check: check-guidance
+check: check-guidance check-release
 	$(UV) cargo fmt -- --check
 	$(MAKE) check-rust-lint
 	$(UV) cargo check --locked --tests
@@ -67,6 +69,13 @@ check-rust-lint:
 
 check-guidance:
 	$(UV) python scripts/check-guidance.py
+
+check-release:
+	$(UV) python scripts/check-release.py
+
+benchmark:
+	cargo bench --locked --no-default-features --bench transport_contracts
+
 
 acceptance: check test-core test-rust test-python
 
