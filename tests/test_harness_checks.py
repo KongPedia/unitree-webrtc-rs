@@ -333,15 +333,40 @@ def release_build():
     return job
 
 
-def test_pull_requests_and_branch_pushes_run_read_only_acceptance_without_publish():
+@pytest.mark.parametrize(
+    "branch, has_pull_request, expected_events",
+    [
+        ("main", False, ["push"]),
+        ("feat/sdk-assurance-hardening", True, ["pull_request"]),
+        ("feat/sdk-assurance-hardening", False, []),
+        ("fix/offline-checks", True, ["pull_request"]),
+    ],
+)
+def test_acceptance_event_policy_avoids_duplicate_feature_pr_runs(branch, has_pull_request, expected_events):
+    import fnmatch
+
+    triggers = workflows()["acceptance.yml"]["on"]
+    push = triggers["push"]
+    accepted_events = []
+    if any(fnmatch.fnmatchcase(branch, pattern) for pattern in push["branches"]):
+        accepted_events.append("push")
+    if has_pull_request and "pull_request" in triggers:
+        accepted_events.append("pull_request")
+    assert accepted_events == expected_events
+    assert set(push) == {"branches"}, "tag pushes must use the release workflow, not direct acceptance"
+
+
+def test_pull_requests_and_main_pushes_run_read_only_acceptance_without_publish():
     candidates = [config for config in workflows().values() if {"pull_request", "push"} <= config["on"].keys()]
-    assert candidates, "no PR/branch acceptance workflow is configured"
+    assert candidates, "no PR/main acceptance workflow is configured"
     for config in candidates:
-        assert config["on"]["push"].get("branches"), "branch pushes must be included"
+        assert not config["on"]["pull_request"], "fork and same-repository PRs must remain unfiltered"
+        assert "workflow_call" in config["on"], "release builds must retain reusable acceptance"
         assert config["permissions"] == {"contents": "read"}
         assert config["concurrency"]["cancel-in-progress"] == "true"
         assert "github.ref" in config["concurrency"]["group"]
         for job in config["jobs"].values():
+            assert "if" not in job, "acceptance must not skip fork PR jobs"
             assert "environment" not in job
             assert "permissions" not in job
             for step in job.get("steps", []):

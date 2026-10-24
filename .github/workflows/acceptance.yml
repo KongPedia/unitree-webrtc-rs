@@ -3,7 +3,7 @@ name: Offline acceptance
 on:
   pull_request:
   push:
-    branches: ["**"]
+    branches: ["main"]
   workflow_call:
     inputs:
       build-wheel:

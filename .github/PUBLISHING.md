@@ -2,7 +2,7 @@
 
 ## CI와 배포 기준
 
-[acceptance.yml](workflows/acceptance.yml)은 PR과 일반 branch push에서 **배포 없이** locked `make acceptance`를 실행한다. `contents: read`만 사용하고 checkout credential을 유지하지 않으며, 같은 PR/ref의 이전 acceptance 실행은 취소한다. Release workflow도 같은 reusable job/matrix를 호출하므로 검증 절차를 별도로 복제하지 않는다.
+[acceptance.yml](workflows/acceptance.yml)은 fork를 포함한 PR과 `main` push에서 **배포 없이** locked `make acceptance`를 실행한다. PR이 열린 feature branch의 push는 PR event로만 검증하여 중복 push 실행을 만들지 않는다. PR이 없는 feature branch는 acceptance가 자동 실행되지 않으므로, 로컬에서 `make acceptance`를 실행한 뒤 PR을 열어 hosted checks를 시작한다. `contents: read`만 사용하고 checkout credential을 유지하지 않으며, 같은 PR/ref의 이전 acceptance 실행은 취소한다. Release workflow도 같은 전체 reusable job/matrix를 호출하므로 검증 절차를 별도로 복제하지 않는다.
 
 [publish-pypi.yml](workflows/publish-pypi.yml)은 버전 태그 `v*.*.*` push 또는 manual `workflow_dispatch`로 시작한다. 두 trigger 모두 production PyPI 배포 경로다. Manual 실행은 **선택한 ref를 배포**하며 태그가 필수는 아니다. TestPyPI 검사나 dry run으로 사용하지 않는다. 동일 ref의 release는 upload 도중 취소하지 않고 순서대로 실행한다.
 
