@@ -38,7 +38,7 @@ USE CODEX NATIVE SUBAGENTS FOR INDEPENDENT PARALLEL SUBTASKS WHEN THAT IMPROVES 
 ## Verification and reporting
 
 - Application changes: inspect `Makefile`, run the smallest relevant regression first, then applicable `make check` and Rust/Python checks. `make test-rust` uses the locked Python environment and Python-linked Rust tests; extension builds alone enable `extension-module`. Report failures rather than weakening checks. Mock Python tests do not validate the native extension; add/use native offline contract coverage when changing bindings.
-- Documentation/skill-only changes: validate applicable guidance metadata/references, inspect diffs and review instruction conflicts. An ordinary prose correction does not require loading unrelated skills. Do not run application tests, builds, CI, services or hardware merely to verify prose.
+- Documentation/skill-only changes: validate local references and plugin-only delivery, parse changed host configuration separately, inspect diffs and review instruction conflicts. An ordinary prose correction does not require loading unrelated skills. Do not run application tests, builds, CI, services or hardware merely to verify prose.
 - Report changed files, exact checks/results, and unverified limits. Separate static evidence, software tests, deployed behavior and physical validation. New performance claims require reproducible workload/platform/version evidence.
 - Existing commit subjects use `[BTB-<id>] <type>. <summary>`; do not invent a ticket. When authorized to commit, explain intent, constraints and verification gaps in the body.
 

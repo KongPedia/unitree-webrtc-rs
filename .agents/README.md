@@ -4,7 +4,7 @@ Start with [AGENTS.md](../AGENTS.md), the requested SDK seam, [engineering workf
 [conventions](../docs/engineering/conventions.md) and relevant [resource policy](../docs/engineering/resource-policy.md).
 The SDK is its own Git root; parent BattleBang settings and tests do not establish its native correctness or permissions.
 Read actual manifests/locks and callers before changing a contract. Shared procedures/resources live in `agent-skills`;
-this directory owns routing/setup and retained legal references, not another procedure library.
+this directory owns project routing/setup, not copied procedures, notices or a source manifest.
 
 ## Package owner and task selection
 
@@ -39,7 +39,7 @@ Keep the existing [PR form](../.github/pull_request_template.md), issue forms an
 not replacement project files or a requirement to create a document per task. Existing contracts live in conventions,
 resource policy, the architecture map and public API docs; new specs/ADRs should link to those owners instead of duplicating them.
 
-Use behavioral regression for changed behavior, characterization for preservation, and static metadata/hash/reference/diff
+Use behavioral regression for changed behavior, characterization for preservation, and static required-document/local-link/delivery-policy/diff
 checks for guidance. Do not run examples, application checks, services, CI or hardware merely to validate prose. Examples
 can actuate a robot. Report static, mock, native, deployed and physical evidence separately.
 

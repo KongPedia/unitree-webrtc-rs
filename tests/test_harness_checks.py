@@ -1,7 +1,6 @@
 """Offline regression coverage for repository guidance and build ordering."""
 
 import importlib.util
-import json
 import subprocess
 from pathlib import Path
 
@@ -19,91 +18,47 @@ def validator():
 
 @pytest.fixture
 def guidance(tmp_path):
-    (tmp_path / ".agents/skills/demo").mkdir(parents=True)
-    (tmp_path / "docs/engineering").mkdir(parents=True)
-    skill = tmp_path / ".agents/skills/demo/SKILL.md"
-    skill.write_text("---\nname: demo\ndescription: Example guidance.\n---\n")
-    import hashlib
-
-    manifest = {
-        "files": [
-            {
-                "local": str(skill.relative_to(tmp_path)),
-                "sha256": hashlib.sha256(skill.read_bytes()).hexdigest(),
-            }
-        ]
-    }
-    (tmp_path / "docs/engineering/skill-sources.json").write_text(json.dumps(manifest))
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents/README.md").write_text("# Project routing\n")
     (tmp_path / "AGENTS.md").write_text(
-        "[skill](.agents/skills/demo/SKILL.md#usage) [web](https://example.org) [anchor](#here)\n"
+        "[routing](.agents/README.md#usage) [web](https://example.org) [anchor](#here)\n"
     )
     (tmp_path / "README.md").write_text("# SDK\n")
     (tmp_path / "CONTRIBUTING.md").write_text("# Contributing\n")
-    return tmp_path, skill
+    return tmp_path
 
 
-def test_guidance_accepts_local_fragment_and_external_links(guidance):
-    root, _ = guidance
-    assert validator().check(root) == []
-
-
-def test_guidance_detects_modified_pinned_copy(guidance):
-    root, skill = guidance
-    skill.write_text(skill.read_text() + "changed\n")
-    assert any("SHA-256" in error for error in validator().check(root))
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        "name: [demo]",
-        "name: demo\nname: duplicate\ndescription: text",
-        "name: demo\ndescription: |\n  text",
-        "name demo\ndescription: text",
-    ],
-)
-def test_metadata_rejects_malformed_or_unsupported_yaml(metadata):
-    with pytest.raises(ValueError):
-        validator().skill_metadata(f"---\n{metadata}\n---\n")
+def test_guidance_accepts_plugin_only_local_fragment_and_external_links(guidance):
+    assert validator().check(guidance) == []
 
 
 def test_guidance_detects_missing_local_link(guidance):
-    root, _ = guidance
-    (root / "AGENTS.md").write_text("[missing](docs/missing.md#section)")
-    assert any("missing local link" in error for error in validator().check(root))
+    (guidance / "AGENTS.md").write_text("[missing](docs/missing.md#section)")
+    assert any("missing local link" in error for error in validator().check(guidance))
 
 
-@pytest.mark.parametrize("document", ["README.md", ".github/PUBLISHING.md", "docs/nested/context.md"])
+@pytest.mark.parametrize(
+    "document", ["README.md", ".agents/README.md", ".github/PUBLISHING.md", "docs/nested/context.md"]
+)
 def test_guidance_checks_all_maintained_documents(guidance, document):
-    root, _ = guidance
-    path = root / document
+    path = guidance / document
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("[obsolete](missing-plan.md)")
-    assert any("missing local link" in error for error in validator().check(root))
+    assert any("missing local link" in error for error in validator().check(guidance))
 
 
 @pytest.mark.parametrize("document", ["AGENTS.md", "README.md", "CONTRIBUTING.md"])
 def test_guidance_requires_entry_documents(guidance, document):
-    root, _ = guidance
-    (root / document).unlink()
-    assert any("missing required document" in error for error in validator().check(root))
+    (guidance / document).unlink()
+    assert any("missing required document" in error for error in validator().check(guidance))
 
 
-@pytest.mark.parametrize("change", ["empty", "duplicate", "unlisted", "outside"])
-def test_guidance_requires_complete_unique_manifest(guidance, change):
-    root, _ = guidance
-    path = root / "docs/engineering/skill-sources.json"
-    manifest = json.loads(path.read_text())
-    if change == "empty":
-        manifest["files"] = []
-    elif change == "duplicate":
-        manifest["files"] *= 2
-    elif change == "unlisted":
-        (root / ".agents/skills/demo/context.md").write_text("pinned context")
-    else:
-        manifest["files"][0]["local"] = "../outside.md"
-    path.write_text(json.dumps(manifest))
-    assert validator().check(root)
+@pytest.mark.parametrize("copied", [".agents/skills/demo/SKILL.md", ".codex/agents/executor.toml"])
+def test_guidance_rejects_copied_shared_skills_and_project_roles(guidance, copied):
+    path = guidance / copied
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("copied guidance")
+    assert any("copied guidance" in error for error in validator().check(guidance))
 
 
 def test_release_installs_and_probes_runtime_plugins_before_acceptance():

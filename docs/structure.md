@@ -17,7 +17,7 @@ Git root may be checked out inside BattleBang; the parent gitlink and unrelated 
 | `docs/engineering/`, `docs/architecture_analysis.md` | Maintained SDK rules, current architecture and resource contracts |
 | `docs/specs/`, `docs/adr/` | Future scoped contract/decision records, linked to existing owners rather than duplicating them |
 | `.github/` | Existing PR/issue forms and release/acceptance workflow configuration, not an executed CI claim |
-| `.agents/` | Shared-plugin routing/setup and retained legal references; no reusable skill bodies or local role prompts |
+| `.agents/` | Project routing/setup only; shared procedures, forms, provenance and licenses stay with the provider |
 | `.codex/config.toml`, `.claude/settings.json` | Shared plugin activation only, not installation, discovery or trust proof |
 | `.copier-answers.yml` | Genuine guidance-only template lineage, not a migration of application files or a plugin payload lock |
 

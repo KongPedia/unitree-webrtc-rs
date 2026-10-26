@@ -16,7 +16,7 @@ help:
 	@echo "  make test-core  # Check/test Rust without Python dependencies"
 	@echo "  make check      # Run guidance and Rust format/lint/type checks"
 	@echo "  make acceptance # Offline checks/core/Rust/fresh-native tests"
-	@echo "  make check-guidance # Verify pinned guidance metadata/hashes/links"
+	@echo "  make check-guidance # Check project docs/links and plugin-only delivery"
 	@echo "  make check-release # Verify project versions before packaging"
 	@echo "  make benchmark  # Release-mode offline codec/event measurements"
 	@echo "  make wheel-smoke WHEEL=path.whl # Isolated fresh-wheel import"

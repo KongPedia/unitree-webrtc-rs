@@ -376,7 +376,7 @@ unitree-webrtc-rs/
 ├── pyproject.toml           # Python project / uv build config
 ├── unitree_webrtc_rs.pyi    # Shipped native API typing
 ├── AGENTS.md               # Agent working agreement
-├── .agents/               # Shared-plugin routing/setup and retained legal notices
+├── .agents/               # Shared-plugin routing/setup only
 ├── src/
 │   ├── audio/               # Audio streaming (GStreamer send/receive)
 │   ├── connection/          # session.rs owner, lifecycle.rs procedures, service.rs transport

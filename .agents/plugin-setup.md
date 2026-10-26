@@ -1,8 +1,9 @@
 # Project plugin setup
 
 Selected identities are listed in [project routing](README.md). Shared skill procedures, optional hooks and generic role
-sources are provided by the central plugins, not locally copied procedure entrypoints. Existing local legal notices,
-project rules and optional project-specific references may remain; they are not a second shared skill library.
+sources are provided by the central plugins, not locally copied procedure entrypoints. Only product-specific authority
+and domain policy remain local. Canonical shared source records and license notices stay with the provider/cache;
+this consumer does not maintain a duplicate skill-source/hash or common-license inventory.
 A marketplace is a local/private catalog, not a requirement to publish to a public store.
 
 ## Register a source once per host
@@ -99,3 +100,9 @@ Keep local rules in project-owned files. Never edit host caches, credentials or 
 
 [OpenAI packaging](https://developers.openai.com/plugins/build/plugins) ·
 [Claude installation](https://code.claude.com/docs/en/plugins/cli-reference)
+
+## Keep native integration state
+
+`.copier-answers.yml` records the template source/revision for genuine Copier updates; it is not the retired
+`skill-sources.json` or a per-project plugin-version lock. Do not remove or hand-rewrite it. `.codex/config.toml` and
+`.claude/settings.json` record plugin enablement. Shared skill updates remain host-owned, separate from these files.
