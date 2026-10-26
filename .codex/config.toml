@@ -1,0 +1,41 @@
+# Project activation only. Source registration and trust are host-owned unless explicitly selected below.
+
+
+[plugins."api-contracts@konglabs-agent-skills"]
+enabled = false
+
+[plugins."common@konglabs-agent-skills"]
+enabled = true
+
+[plugins."cpp-firmware@konglabs-agent-skills"]
+enabled = false
+
+[plugins."fastapi@konglabs-agent-skills"]
+enabled = false
+
+[plugins."litestar@konglabs-agent-skills"]
+enabled = false
+
+[plugins."nestjs@konglabs-agent-skills"]
+enabled = false
+
+[plugins."nextjs@konglabs-agent-skills"]
+enabled = false
+
+[plugins."python@konglabs-agent-skills"]
+enabled = false
+
+[plugins."react-ui@konglabs-agent-skills"]
+enabled = false
+
+[plugins."robotics@konglabs-agent-skills"]
+enabled = true
+
+[plugins."rust@konglabs-agent-skills"]
+enabled = true
+
+[plugins."session-guidance@konglabs-agent-skills"]
+enabled = false
+
+[plugins."typescript@konglabs-agent-skills"]
+enabled = false

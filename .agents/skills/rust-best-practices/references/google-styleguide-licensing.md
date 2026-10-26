@@ -1,12 +1,12 @@
 # Google Rust Style Guide attribution and licensing
 
-This local snapshot is the Google Rust Style Guide by Google. It is preserved as reference material, not as Google endorsement or blanket project policy.
+The Google Rust Style Guide by Google is supplied by the shared Rust plugin as reference material, not as Google endorsement or blanket project policy. This repository retains its attribution and licensing declaration; [SDK applicability rules](../../../../docs/engineering/conventions.md#using-googles-rust-style-guide) and shared provenance identify the snapshot.
 
 - [Original guide at the pinned revision](https://github.com/google/styleguide/blob/ac81bb465fdc5f0f68f64b72a90024c7c52442cc/rustguide.md)
 - [Original licensing declaration at the pinned revision](https://github.com/google/styleguide/blob/ac81bb465fdc5f0f68f64b72a90024c7c52442cc/README.md#licensing)
 - [Local CC-BY-3.0 license text](google-styleguide-LICENSE.md)
 
-Modified excerpt from the original README: only the Licensing section is retained below; this attribution and source-link wrapper has been added. The local guide itself is unmodified.
+Modified excerpt from the original README: only the Licensing section is retained below; this attribution and source-link wrapper has been added. The guide itself is unmodified in the shared Rust plugin; it is no longer copied into this repository.
 
 ## Licensing
 

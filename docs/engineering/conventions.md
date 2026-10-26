@@ -134,7 +134,7 @@ User-facing configuration is in [README logging](../../README.md#logging-from-py
 
 ## 9. Rust-specific decisions for coding agents
 
-Read this adaptation before applying the pinned generic skills. They supply concepts, not code validated against this crate's toolchain, dependencies or resource contracts.
+Read this adaptation before applying the selected shared skills. They supply concepts, not code validated against this crate's toolchain, dependencies or resource contracts.
 
 - **Check the actual build contract.** Use [rust-toolchain.toml](../../rust-toolchain.toml), [Cargo.toml](../../Cargo.toml) and [Cargo.lock](../../Cargo.lock), not a prompt's “Rust 1.75+” or “latest” label. The pinned compiler is not a declared minimum supported Rust version. Do not change edition, features, dependencies or use nightly-only APIs to imitate an example. Consult version-matching API docs; a 0.28-series PyO3 guide is not patch-specific verification.
 - **Choose Rust-shaped boundaries.** Prefer existing structs, enums, functions and owned values; add a trait for a real replaceable boundary, not a Python class hierarchy. Borrow inputs for synchronous helpers when ownership is unnecessary; transfer owned data at task/FFI boundaries when its lifetime requires it. Do not silence borrow errors with blanket `clone`, `Arc<Mutex<_>>`, leaks or `unsafe`. Add identity/unit types only for demonstrated ambiguity; preserve established aliases and wire fields.
@@ -154,7 +154,7 @@ Read this adaptation before applying the pinned generic skills. They supply conc
 
 ## 10. External Rust guides and project precedence
 
-The local [Rust best practices skill](../../.agents/skills/rust-best-practices/SKILL.md) complements the existing async and architecture skills. Use selected chapters for the changed seam, not a new mandatory framework. Examples are reference knowledge, not verified code for this SDK.
+Shared `rust:rust-best-practices` complements `rust:rust-async-patterns` and `common:architecture-patterns`; select them through the [agent workflow](agent-workflow.md#task-scoped-shared-guidance). Use selected chapters for the changed seam, not a new mandatory framework. Examples are reference knowledge, not verified code for this SDK.
 
 - **Keep the current build and error contracts.** An upstream `allowed-tools` list or Cargo command is not execution authority. Use the feature-aware Makefile checks when application execution is in scope; do not blindly run `--all-features` across the PyO3 extension/test modes. Do not introduce `thiserror`, `anyhow`, `insta`, nightly tools, crate-wide lint bans or a new test framework just to match examples.
 - **Treat generic thresholds and patterns as heuristics.** A fixed byte-count rule for `Copy`, one-assertion-per-test, generics over `dyn`, typestate, and broad `expect`/clone prohibitions do not replace observed costs, meaningful boundary assertions or this crate's existing boxed-future/error/public API contracts. Do not split/coalesce tests or add traits merely to obey an illustrative rule.
@@ -162,18 +162,18 @@ The local [Rust best practices skill](../../.agents/skills/rust-best-practices/S
 
 ### Using Google's Rust Style Guide
 
-The [official Google guide](https://google.github.io/styleguide/rustguide.html) is preserved as a [pinned local snapshot](../../.agents/skills/rust-best-practices/references/google-rust-style-guide.md), with its [license](../../.agents/skills/rust-best-practices/references/google-styleguide-LICENSE.md) and [attribution/licensing scope](../../.agents/skills/rust-best-practices/references/google-styleguide-licensing.md). It is design/style reference material, not Google's SDK endorsement or a new repository-wide lint policy. Read relevant headings when making Rust API/style/safety judgments.
+The [official Google guide](https://google.github.io/styleguide/rustguide.html) is supplied by the Rust plugin as a [reviewed shared snapshot](https://github.com/KongPedia/agent-skills/blob/d56c0780a2d9ce5456d8594fd19d6a19f8bbbb7c/plugins/rust/skills/rust-best-practices/references/google-rust-style-guide.md), with its retained local [license](../../.agents/skills/rust-best-practices/references/google-styleguide-LICENSE.md) and [attribution/licensing scope](../../.agents/skills/rust-best-practices/references/google-styleguide-licensing.md). It is design/style reference material, not Google's SDK endorsement or a new repository-wide lint policy. Read relevant headings when making Rust API/style/safety judgments.
 
 - Apply useful general guidance contextually: flexible borrowed inputs (`&str`, slices), clear ownership/naming, standard traits where appropriate, explicit errors and safety/panic documentation, and readable pattern matching. Preserve established Python aliases, wire fields and Rust public compatibility; do not mass-rename APIs or add `non_exhaustive` solely for style.
 - **Exclude platform-specific rules.** Chromium's async/await and standard-thread bans, flat-file/small-crate layout, import/build tooling and test framework do not apply to this Cargo/Tokio SDK. Fuchsia-specific mutex and test guidance also does not apply. Keep current modules, Tokio, standard/native workers, PyO3 macros and existing offline tests.
 - **Shared ownership is contextual.** Google's `Arc`/`Rc` preference includes a complexity exception, and pointer cloning is not a deep copy. Keep justified async/FFI ownership; make lifecycle completion explicit rather than attempting a blanket ban or replacing it with unsafe/complex borrowing.
 - **Do not import formatter/toolchain policy.** Retain `rust-toolchain.toml`, edition, Cargo locks and current rustfmt/Clippy configuration. Google's width/options, unstable examples and build-system conventions do not authorize tool upgrades or a formatting-only rewrite.
 
-The snapshot's prose is CC-BY-3.0 and its code samples are Apache-2.0 per the upstream licensing declaration. Source identities, immutable revisions, original/local hashes and adaptations are recorded in [skill-sources.json](skill-sources.json); the original guide remains unchanged.
+The snapshot's prose is CC-BY-3.0 and its code samples are Apache-2.0 per the upstream licensing declaration. Shared snapshot identities and upstream/source/payload hashes are in [Rust plugin provenance](https://github.com/KongPedia/agent-skills/blob/d56c0780a2d9ce5456d8594fd19d6a19f8bbbb7c/plugins/rust/provenance.json); the original guide remains unchanged there. [skill-sources.json](skill-sources.json) records the remaining local notices and optional prompts, not installed plugin bytes.
 
 ## 11. Module design and explicit migration
 
-The selected [codebase-design](../../.agents/skills/codebase-design/SKILL.md) and [deprecation-and-migration](../../.agents/skills/deprecation-and-migration/SKILL.md) skills complement the rules above; neither mandates a new architecture or removal project.
+The selected shared `common:codebase-design` and `common:deprecation-and-migration` skills complement the rules above; neither mandates a new architecture or removal project.
 
 - Use deep-module vocabulary to clarify responsibility and caller leverage, not to rename established services/ports, public aliases or wire fields. A safety/FFI/protocol seam can be justified without two adapters. Compare designs proportionately; a small choice does not require three or more agents or recursive delegation.
 - Preserve caller-observable tests and useful internal codec, malformed-input, cancellation/completion, shutdown and FFI regressions. Consolidate tests only with evidence of equivalent or stronger coverage; deepening is not authority to delete shallow-unit tests automatically. Keep explicit error/panic/unsafe documentation and resource completion ownership.
