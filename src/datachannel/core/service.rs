@@ -2360,7 +2360,8 @@ mod tests {
                 Ok(())
             }
         }
-        let (service, _, _, callback_rx) = make_service("open");
+        // Keep ingress alive so router shutdown cannot invalidate this test's callback generation.
+        let (service, _channel, _ingress, callback_rx) = make_service("open");
         service.subscribe("errors").unwrap();
         let secret = "sentinel-private-key".repeat(1024);
         let message = json!({"type": "errors", "topic": "errors", "data": [secret]});
