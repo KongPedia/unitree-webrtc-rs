@@ -170,3 +170,12 @@ The [official Google guide](https://google.github.io/styleguide/rustguide.html) 
 - **Do not import formatter/toolchain policy.** Retain `rust-toolchain.toml`, edition, Cargo locks and current rustfmt/Clippy configuration. Google's width/options, unstable examples and build-system conventions do not authorize tool upgrades or a formatting-only rewrite.
 
 The snapshot's prose is CC-BY-3.0 and its code samples are Apache-2.0 per the upstream licensing declaration. Source identities, immutable revisions, original/local hashes and adaptations are recorded in [skill-sources.json](skill-sources.json); the original guide remains unchanged.
+
+## 11. Module design and explicit migration
+
+The selected [codebase-design](../../.agents/skills/codebase-design/SKILL.md) and [deprecation-and-migration](../../.agents/skills/deprecation-and-migration/SKILL.md) skills complement the rules above; neither mandates a new architecture or removal project.
+
+- Use deep-module vocabulary to clarify responsibility and caller leverage, not to rename established services/ports, public aliases or wire fields. A safety/FFI/protocol seam can be justified without two adapters. Compare designs proportionately; a small choice does not require three or more agents or recursive delegation.
+- Preserve caller-observable tests and useful internal codec, malformed-input, cancellation/completion, shutdown and FFI regressions. Consolidate tests only with evidence of equivalent or stronger coverage; deepening is not authority to delete shallow-unit tests automatically. Keep explicit error/panic/unsafe documentation and resource completion ownership.
+- Use migration guidance only for an explicitly requested removal, deprecation decision or API migration. Account for Rust exports, Python aliases/kwargs, stubs/helpers, examples, docs, tests and known downstream consumers. Unknown external users of a published SDK are not zero consumers: preserve supported aliases/adapters until compatibility obligations are accounted for, or report the unresolved removal decision.
+- Inactivity or legacy naming alone does not authorize deletion. Pattern examples do not authorize new flags, dependencies/frameworks, production traffic simulation, deployment/hardware checks or commits. Document compatibility window, observed evidence, rollback and unverified external/physical limits using the existing verification contract.

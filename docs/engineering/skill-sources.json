@@ -188,6 +188,66 @@
       "upstream_sha256": "1caced48cf6d3fec01ec04048efee99d96e1bfc21b2cecb7225bd8404c9faff1",
       "sha256": "775a3f7231221ec544713622fdbb74ac8150eed763dc77b7a81a22d246024d33",
       "modifications": "Retain the original Licensing section verbatim, excluding its external badge and unrelated README sections; add Google/title attribution, immutable original guide/declaration links, local license link and explicit extraction/modification notice. Preserve the prose CC-BY-3.0/code-sample Apache-2.0 distinction and both official license URLs."
+    },
+    {
+      "local": ".agents/skills/codebase-design/SKILL.md",
+      "source_id": "matt-codebase-design",
+      "repository": "https://github.com/mattpocock/skills",
+      "revision": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+      "source": "skills/engineering/codebase-design/SKILL.md",
+      "upstream_sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2",
+      "sha256": "f52776478aa582246d5158fe6af2c62363330ce6a64a4c937249672e3bc12138",
+      "modifications": "Preserve name and useful deep-module glossary/principles/examples. Narrow description; add local adaptation, canonical conventions/provenance/license links. Retain existing SDK vocabulary, aliases and wire fields; replace fixed adapter-count and interface-only testing absolutes with responsibility/evidence and internal safety coverage. Preserve lifecycle/error/panic/unsafe documentation; qualify surface-area claims, plural compatibility surfaces and optional native design comparison. Normalize trailing whitespace/newline."
+    },
+    {
+      "local": ".agents/skills/codebase-design/DEEPENING.md",
+      "source_id": "matt-codebase-design",
+      "repository": "https://github.com/mattpocock/skills",
+      "revision": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+      "source": "skills/engineering/codebase-design/DEEPENING.md",
+      "upstream_sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1",
+      "sha256": "c3c166bf0138eb0ff2b8befb40234470543ce3af7e5c44b92eae2642d8ca857d",
+      "modifications": "Add adaptation notice; qualify in-process merging, substitute existing offline stand-ins/ports and remove dependency/framework assumptions. Replace fixed two-adapter quota and literal automatic shallow-unit-test deletion with demonstrated responsibility, characterization, equivalent-coverage review and retained codec/malformed-input/cancellation/shutdown/FFI regressions. Normalize trailing whitespace/newline."
+    },
+    {
+      "local": ".agents/skills/codebase-design/DESIGN-IT-TWICE.md",
+      "source_id": "matt-codebase-design",
+      "repository": "https://github.com/mattpocock/skills",
+      "revision": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+      "source": "skills/engineering/codebase-design/DESIGN-IT-TWICE.md",
+      "upstream_sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010",
+      "sha256": "af641e15f5a253ed19eb6b60d2949603def4159d6b41ab7ed8775f0af94d5c9a",
+      "modifications": "Add adaptation notice. Replace mandatory 3+ agent ceremony with proportionate direct or bounded native comparison and no recursive delegation. Remove missing GLOSSARY.md dependency in favor of actual SDK vocabulary/conventions/callers, preserve aliases/wire/lifecycle/FFI contracts, and avoid fixed entrypoint quotas or new permission/commit authority. Normalize trailing whitespace/newline."
+    },
+    {
+      "local": ".agents/skills/codebase-design/references/matt-LICENSE.md",
+      "source_id": "matt-codebase-design",
+      "repository": "https://github.com/mattpocock/skills",
+      "revision": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+      "source": "LICENSE",
+      "upstream_sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+      "sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+      "modifications": ""
+    },
+    {
+      "local": ".agents/skills/deprecation-and-migration/SKILL.md",
+      "source_id": "addy-deprecation-and-migration",
+      "repository": "https://github.com/addyosmani/agent-skills",
+      "revision": "aeac41d4d005999432bb7312f7ff06383a91d59d",
+      "source": "skills/deprecation-and-migration/SKILL.md",
+      "upstream_sha256": "6a624f942e09c69863a4219b9bd5d56975026b67b0c70bc83385ffd2120b6142",
+      "sha256": "7255540889e5402663acadbc0ee16c9b04788d1fdb001dc7b499ea928490dee5",
+      "modifications": "Preserve original name and useful decision/advisory/consumer-migration/adapter patterns. Narrow activation to explicit SDK removal/API-migration tasks; add local adaptation/provenance/license/canonical-policy links. Account for unknown external consumers and retain supported aliases/wire fields. Replace automatic inactivity/removal, production proof/traffic and associated-test deletion mandates with scoped evidence, compatibility decision and equivalent safety coverage. Qualify optional flags/rollout illustration and remove installer example. Omit database-specific section/rationalizations/checklist and unavailable incremental-implementation reference as out of SDK scope. Preserve lifecycle/FFI/error/panic/safety documentation, rollback and authority limits. Normalize trailing whitespace/newline."
+    },
+    {
+      "local": ".agents/skills/deprecation-and-migration/references/addy-LICENSE.md",
+      "source_id": "addy-deprecation-and-migration",
+      "repository": "https://github.com/addyosmani/agent-skills",
+      "revision": "aeac41d4d005999432bb7312f7ff06383a91d59d",
+      "source": "LICENSE",
+      "upstream_sha256": "6f202f8bd568cd730dbb2b0d1f8e243bc74c2fa1f64dbce9b2c7ea08bd5c9fd7",
+      "sha256": "6f202f8bd568cd730dbb2b0d1f8e243bc74c2fa1f64dbce9b2c7ea08bd5c9fd7",
+      "modifications": ""
     }
   ],
   "source_resolution": "Rows without source_id use the existing top-level repository/revision; source_id rows resolve sources and must match any per-row repository/revision.",
@@ -212,6 +272,26 @@
       ],
       "license_note": "Google README Licensing identifies prose as CC-BY-3.0 and code samples as Apache-2.0; faithful licensing excerpt, attribution and original license URLs are preserved locally.",
       "resource_scope": "Unmodified rustguide.md and CC-BY-3.0 LICENSE plus adapted README Licensing excerpt with attribution and immutable source links; excludes unrelated Google guides and Google-specific build tooling."
+    },
+    {
+      "id": "matt-codebase-design",
+      "repository": "https://github.com/mattpocock/skills",
+      "revision": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+      "license": ".agents/skills/codebase-design/references/matt-LICENSE.md",
+      "skills": [
+        "codebase-design"
+      ],
+      "resource_scope": "Selected original codebase-design entrypoint, DEEPENING.md, DESIGN-IT-TWICE.md and unchanged MIT LICENSE; excludes sibling skills, plugins, routers and role configuration."
+    },
+    {
+      "id": "addy-deprecation-and-migration",
+      "repository": "https://github.com/addyosmani/agent-skills",
+      "revision": "aeac41d4d005999432bb7312f7ff06383a91d59d",
+      "license": ".agents/skills/deprecation-and-migration/references/addy-LICENSE.md",
+      "skills": [
+        "deprecation-and-migration"
+      ],
+      "resource_scope": "Selected original deprecation-and-migration entrypoint adapted for explicit SDK removal/API migration and unchanged MIT LICENSE; excludes sibling skills, database deployment guidance, plugins and role configuration."
     }
   ]
 }
