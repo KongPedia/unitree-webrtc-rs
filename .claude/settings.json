@@ -7,7 +7,7 @@
     "litestar@konglabs-agent-skills": false,
     "nestjs@konglabs-agent-skills": false,
     "nextjs@konglabs-agent-skills": false,
-    "python@konglabs-agent-skills": false,
+    "python@konglabs-agent-skills": true,
     "react-ui@konglabs-agent-skills": false,
     "robotics@konglabs-agent-skills": true,
     "rust@konglabs-agent-skills": true,

@@ -23,7 +23,7 @@ enabled = false
 enabled = false
 
 [plugins."python@konglabs-agent-skills"]
-enabled = false
+enabled = true
 
 [plugins."react-ui@konglabs-agent-skills"]
 enabled = false

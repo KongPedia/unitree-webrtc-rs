@@ -20,10 +20,16 @@ application layout to adopt. Rust owns transport, codecs, queues and session lif
 - `rust@konglabs-agent-skills`: Rust ownership/API/error/unsafe guidance and Tokio concurrency/lifetime guidance,
   applied with SDK [Rust adaptations](../docs/engineering/conventions.md#9-rust-specific-decisions-for-coding-agents)
   and [external-guide limits](../docs/engineering/conventions.md#10-external-rust-guides-and-project-precedence).
+- `python@konglabs-agent-skills`: task-conditional guidance for maintained Python example/helpers, development tools,
+  shipped `.pyi` contracts, pytest and packaging code. Select design/structure, error handling, resource management,
+  asyncio, typing or testing procedures only for the changed Python responsibility; preserve Python >=3.10 and Maturin.
 - `robotics@konglabs-agent-skills`: only for actual robot/device I/O, units/frames/clocks, command authority,
   freshness, reconnect or lifecycle work. This grants no robot access, physical execution or safety validation.
 
-Python and unrelated technology bundles are off; the native Python/FFI contracts remain mandatory in local SDK policy.
+Common, Rust, Python and Robotics are selected; unrelated technology bundles remain off. Python is a project-owned
+coverage override for actual maintained Python code, not a second package/composition: genuine Copier answers retain
+the Rust profile. Rust-only PyO3 conversion/ownership work still uses Rust procedures and local FFI policy; add Python
+procedures when helper, public typing, test or packaging behavior is affected. No Python hot-path migration is implied.
 The optional `session-guidance` hook is off. Read the actual task-relevant entrypoint exposed by the host; if unavailable,
 disclose that and use local guidance without copying a procedure, installing tools or claiming discovery/adherence.
 

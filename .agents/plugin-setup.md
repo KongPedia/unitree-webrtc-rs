@@ -6,6 +6,12 @@ and domain policy remain local. Canonical shared source records and license noti
 this consumer does not maintain a duplicate skill-source/hash or common-license inventory.
 A marketplace is a local/private catalog, not a requirement to publish to a public store.
 
+This SDK selects Common, Rust, Python and Robotics. Python is an intentional project-owned activation override for
+maintained helpers/tools, the public typing surface, pytest and packaging code. Genuine Copier answers retain the Rust
+profile; no second package/composition is implied. Guidance adoption preserves host configs, so reconcile this override
+with the selected commands below rather than regenerating a layout. Rust-only PyO3 work still follows Rust/local FFI
+policy; Python procedures remain conditional on actual Python-side work. Selection is not installation or discovery.
+
 ## Register a source once per host
 
 
@@ -43,12 +49,14 @@ Codex recovery: first verify the registered marketplace source and cached revisi
 
 ```bash
 codex plugin add common@konglabs-agent-skills
+codex plugin add python@konglabs-agent-skills
 codex plugin add robotics@konglabs-agent-skills
 codex plugin add rust@konglabs-agent-skills
 ```
 
 ```bash
 claude plugin install common@konglabs-agent-skills --scope project
+claude plugin install python@konglabs-agent-skills --scope project
 claude plugin install robotics@konglabs-agent-skills --scope project
 claude plugin install rust@konglabs-agent-skills --scope project
 ```
