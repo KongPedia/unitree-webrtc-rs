@@ -113,7 +113,7 @@ For running the examples (Video viewing, Audio playing):
 
 ## Development Setup
 
-Contributor conventions, local Codex skills and reusable task prompts: [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and [agent workflow](docs/engineering/agent-workflow.md).
+Contributor conventions, shared plugin routing and reusable task prompts: [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and [agent workflow](docs/engineering/agent-workflow.md).
 
 ### One-command bootstrap (recommended)
 
@@ -376,7 +376,7 @@ unitree-webrtc-rs/
 ├── pyproject.toml           # Python project / uv build config
 ├── unitree_webrtc_rs.pyi    # Shipped native API typing
 ├── AGENTS.md               # Agent working agreement
-├── .agents/skills/         # Pinned existing upstream skills
+├── .agents/               # Shared-plugin routing/setup only
 ├── src/
 │   ├── audio/               # Audio streaming (GStreamer send/receive)
 │   ├── connection/          # session.rs owner, lifecycle.rs procedures, service.rs transport

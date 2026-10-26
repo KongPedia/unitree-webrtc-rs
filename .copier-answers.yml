@@ -1,0 +1,11 @@
+# Managed by Copier; retain this file for reviewed updates.
+_commit: v0.1.1
+_src_path: https://github.com/KongPedia/project-blueprints.git
+adoption: guidance
+agent_skills_ref: stable
+agent_skills_repository: ''
+enable_agent_hooks: false
+layout: single
+profile: rust
+project_name: unitree-webrtc-rs
+robotics: true

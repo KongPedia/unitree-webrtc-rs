@@ -1,0 +1,17 @@
+{
+  "enabledPlugins": {
+    "api-contracts@konglabs-agent-skills": false,
+    "common@konglabs-agent-skills": true,
+    "cpp-firmware@konglabs-agent-skills": false,
+    "fastapi@konglabs-agent-skills": false,
+    "litestar@konglabs-agent-skills": false,
+    "nestjs@konglabs-agent-skills": false,
+    "nextjs@konglabs-agent-skills": false,
+    "python@konglabs-agent-skills": true,
+    "react-ui@konglabs-agent-skills": false,
+    "robotics@konglabs-agent-skills": true,
+    "rust@konglabs-agent-skills": true,
+    "session-guidance@konglabs-agent-skills": false,
+    "typescript@konglabs-agent-skills": false
+  }
+}
