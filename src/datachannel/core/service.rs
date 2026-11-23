@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
@@ -218,7 +218,7 @@ where
     validation_key: Arc<Mutex<String>>,
     callback_events_tx: EventSender,
     data_channel_opened: Arc<AtomicBool>,
-    heartbeat_last_response: Arc<AtomicU64>,
+    heartbeat_last_response: Arc<Mutex<Option<Instant>>>,
     heartbeat_running: Arc<AtomicBool>,
     heartbeat_stop_tx: Arc<Mutex<Option<Sender<()>>>>,
     network_probe_running: Arc<AtomicBool>,
@@ -342,7 +342,7 @@ where
             validation_key: Arc::new(Mutex::new(String::new())),
             callback_events_tx,
             data_channel_opened: Arc::new(AtomicBool::new(false)),
-            heartbeat_last_response: Arc::new(AtomicU64::new(0)),
+            heartbeat_last_response: Arc::new(Mutex::new(None)),
             heartbeat_running: Arc::new(AtomicBool::new(false)),
             heartbeat_stop_tx: Arc::new(Mutex::new(None)),
             network_probe_running: Arc::new(AtomicBool::new(false)),
@@ -610,11 +610,12 @@ where
     }
 
     pub fn last_heartbeat_age_s(&self) -> Option<u64> {
-        let last = self.heartbeat_last_response.load(Ordering::Relaxed);
-        if last == 0 {
-            return None;
-        }
-        Some(Self::now_secs_u64().saturating_sub(last))
+        self.heartbeat_age_secs_at(Instant::now())
+    }
+
+    fn heartbeat_age_secs_at(&self, now: Instant) -> Option<u64> {
+        let last_response = *self.heartbeat_last_response.lock().unwrap();
+        last_response.map(|last| now.saturating_duration_since(last).as_secs())
     }
 
     pub fn should_process(&self, topic_or_type: &str) -> bool {
@@ -661,7 +662,7 @@ where
         self.stop_heartbeat();
         self.network_probe_running.store(false, Ordering::Relaxed);
         self.data_channel_opened.store(false, Ordering::Relaxed);
-        self.heartbeat_last_response.store(0, Ordering::Relaxed);
+        *self.heartbeat_last_response.lock().unwrap() = None;
         self.chunk_data_storage.lock().unwrap().clear();
         self.fail_all_pending("DataChannel session reset");
     }
@@ -856,8 +857,7 @@ where
             value if value == types.validation => self.handle_validation(message),
             value if value == types.rtc_inner_req => self.handle_rtc_inner_req(message),
             value if value == types.heartbeat => {
-                self.heartbeat_last_response
-                    .store(Self::now_secs_u64(), Ordering::Relaxed);
+                *self.heartbeat_last_response.lock().unwrap() = Some(Instant::now());
             }
             value
                 if value == types.errors || value == types.add_error || value == types.rm_error =>
@@ -880,8 +880,7 @@ where
     fn handle_validation(&self, message: &Value) {
         if message.get("data").and_then(Value::as_str) == Some("Validation Ok.") {
             self.data_channel_opened.store(true, Ordering::Relaxed);
-            self.heartbeat_last_response
-                .store(Self::now_secs_u64(), Ordering::Relaxed);
+            *self.heartbeat_last_response.lock().unwrap() = Some(Instant::now());
             print_status("Data Channel", "verified");
             self.start_heartbeat_in_session();
             self.request_network_status_once();
@@ -1177,28 +1176,8 @@ where
                     if service.session_id.load(Ordering::SeqCst) != epoch {
                         break;
                     }
-                    let now = Self::now_secs_u64();
-                    let last = service.heartbeat_last_response.load(Ordering::Relaxed);
-                    if last > 0 && now.saturating_sub(last) > 6 {
-                        warn!(
-                            event = "heartbeat_timeout",
-                            elapsed_sec = now.saturating_sub(last),
-                            "Heartbeat timeout detected"
-                        );
-                        service.stop_heartbeat();
-                        service.data_channel_opened.store(false, Ordering::Relaxed);
-                        service.fail_all_pending("Heartbeat timeout");
-                        service.chunk_data_storage.lock().unwrap().clear();
+                    if !service.heartbeat_tick_in_session(Instant::now(), Self::now_secs_u64()) {
                         break;
-                    }
-
-                    if service.transport.ready_state() == "open" {
-                        let formatted = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                        let data = json!({
-                            "timeInStr": formatted,
-                            "timeInNum": now,
-                        });
-                        let _ = service.send_message_locked("", Some(data), dc_types().heartbeat);
                     }
 
                     drop(lifecycle);
@@ -1210,6 +1189,30 @@ where
                 }
             })
             .expect("failed to spawn heartbeat thread");
+    }
+
+    // Caller holds lifecycle_lock for the active epoch. Only the wire timestamp uses wall time.
+    fn heartbeat_tick_in_session(&self, now: Instant, wire_secs: u64) -> bool {
+        if let Some(elapsed_sec) = self.heartbeat_age_secs_at(now).filter(|age| *age > 6) {
+            warn!(
+                event = "heartbeat_timeout",
+                elapsed_sec, "Heartbeat timeout detected"
+            );
+            self.stop_heartbeat();
+            self.data_channel_opened.store(false, Ordering::Relaxed);
+            self.fail_all_pending("Heartbeat timeout");
+            self.chunk_data_storage.lock().unwrap().clear();
+            return false;
+        }
+
+        if self.transport.ready_state() == "open" {
+            let data = json!({
+                "timeInStr": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                "timeInNum": wire_secs,
+            });
+            let _ = self.send_message_locked("", Some(data), dc_types().heartbeat);
+        }
+        true
     }
 
     fn request_network_status_once(&self) {
@@ -2219,7 +2222,7 @@ mod tests {
         service.process_ingress(
             DcMessage::Text(json!({"type":"heartbeat"}).to_string()).for_generation(old),
         );
-        assert_eq!(service.heartbeat_last_response.load(Ordering::SeqCst), 0);
+        assert_eq!(service.last_heartbeat_age_s(), None);
         service.process_ingress(DcMessage::Text(json!({"type":"res", "topic":"topic", "data":{"content_info":{"enable_chunking":true,"chunk_index":1,"total_chunk_num":2},"data":[1]}}).to_string()).for_generation(old));
         assert!(service.chunk_data_storage.lock().unwrap().is_empty());
     }
@@ -2983,6 +2986,7 @@ mod tests {
             service.heartbeat_running.load(Ordering::Relaxed),
             "heartbeat should start after validation"
         );
+        assert!(service.last_heartbeat_age_s().is_some());
     }
 
     // ── chunked response ──────────────────────────────────────────────────────
@@ -3197,14 +3201,103 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_survives_forward_wall_clock_step_and_keeps_wire_timestamp() {
+        let (service, channel, _tx, _rx) = make_service("open");
+        let last_response = Instant::now();
+        let original_wall_secs = 1_800_000_000;
+        *service.heartbeat_last_response.lock().unwrap() = Some(last_response);
+        service.heartbeat_running.store(true, Ordering::Relaxed);
+        service.data_channel_opened.store(true, Ordering::Relaxed);
+
+        let stepped_wall_secs = original_wall_secs + 219 + 2;
+        assert!(service
+            .heartbeat_tick_in_session(last_response + Duration::from_secs(2), stepped_wall_secs,));
+        assert!(service.is_open());
+        let sent = channel.sent.lock().unwrap();
+        let message: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(message["type"], dc_types().heartbeat);
+        assert_eq!(message["data"]["timeInNum"], stepped_wall_secs);
+        assert!(message["data"]["timeInStr"].is_string());
+    }
+
+    #[test]
+    fn heartbeat_expires_on_monotonic_boundary_after_backward_wall_clock_step() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let last_response = Instant::now();
+        let original_wall_secs = 1_800_000_000;
+        *service.heartbeat_last_response.lock().unwrap() = Some(last_response);
+        service.heartbeat_running.store(true, Ordering::Relaxed);
+        service.data_channel_opened.store(true, Ordering::Relaxed);
+
+        let stepped_wall_secs = original_wall_secs - 219;
+        let (before_deadline, at_deadline) = {
+            let _lifecycle = service.lifecycle_lock.lock().unwrap();
+            (
+                service.heartbeat_tick_in_session(
+                    last_response + Duration::from_millis(6_999),
+                    stepped_wall_secs,
+                ),
+                service.heartbeat_tick_in_session(
+                    last_response + Duration::from_secs(7),
+                    stepped_wall_secs + 1,
+                ),
+            )
+        };
+        assert!(before_deadline);
+        assert!(!at_deadline);
+        assert!(!service.is_open());
+        assert!(!service.heartbeat_running());
+    }
+
+    #[test]
+    fn heartbeat_observation_and_stop_do_not_preserve_an_old_epoch() {
+        let (service, _channel, _tx, _rx) = make_service("open");
+        let old_epoch = service.session_id.load(Ordering::SeqCst);
+        let ack = || DcMessage::Text(json!({"type": "heartbeat"}).to_string());
+        service.process_ingress(ack().for_generation(old_epoch));
+        assert!(service.clone().last_heartbeat_age_s().is_some());
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let (done_tx, done_rx) = bounded(2);
+        let ingress = {
+            let (service, start, done) = (service.clone(), start.clone(), done_tx.clone());
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..32 {
+                    service.process_ingress(ack().for_generation(old_epoch));
+                    let _ = service.last_heartbeat_age_s();
+                }
+                done.send(()).unwrap();
+            })
+        };
+        let stop = {
+            let (service, start) = (service.clone(), start.clone());
+            thread::spawn(move || {
+                start.wait();
+                service.stop_background_tasks();
+                done_tx.send(()).unwrap();
+            })
+        };
+        start.wait();
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        ingress.join().unwrap();
+        stop.join().unwrap();
+
+        assert_eq!(service.last_heartbeat_age_s(), None);
+        let new_epoch = service.session_id.load(Ordering::SeqCst);
+        service.process_ingress(ack().for_generation(new_epoch));
+        assert!(service.last_heartbeat_age_s().is_some());
+    }
+
+    #[test]
     fn datachannel_status_reports_transport_and_heartbeat() {
         let (service, _channel, _dc_tx, _cb_rx) = make_service("open");
         service.data_channel_opened.store(true, Ordering::Relaxed);
         service.heartbeat_running.store(true, Ordering::Relaxed);
-        service.heartbeat_last_response.store(
-            DataChannelService::<MockDataChannel>::now_secs_u64().saturating_sub(3),
-            Ordering::Relaxed,
-        );
+        *service.heartbeat_last_response.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs(3));
 
         assert_eq!(service.ready_state(), "open");
         assert!(service.is_open());

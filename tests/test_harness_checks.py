@@ -288,44 +288,30 @@ def release_build():
     return job
 
 
-@pytest.mark.parametrize(
-    "branch, has_pull_request, expected_events",
-    [
-        ("main", False, ["push"]),
-        ("feat/sdk-assurance-hardening", True, ["pull_request"]),
-        ("feat/sdk-assurance-hardening", False, []),
-        ("fix/offline-checks", True, ["pull_request"]),
-    ],
-)
-def test_acceptance_event_policy_avoids_duplicate_feature_pr_runs(branch, has_pull_request, expected_events):
-    import fnmatch
-
-    triggers = workflows()["acceptance.yml"]["on"]
-    push = triggers["push"]
-    accepted_events = []
-    if any(fnmatch.fnmatchcase(branch, pattern) for pattern in push["branches"]):
-        accepted_events.append("push")
-    if has_pull_request and "pull_request" in triggers:
-        accepted_events.append("pull_request")
-    assert accepted_events == expected_events
-    assert set(push) == {"branches"}, "tag pushes must use the release workflow, not direct acceptance"
+def test_acceptance_only_runs_for_main_pr_merges_or_reusable_calls():
+    config = workflows()["acceptance.yml"]
+    assert config["on"]["pull_request"] == {"branches": ["main"], "types": ["closed"]}
+    assert set(config["on"]) == {"pull_request", "workflow_call"}
+    assert config["jobs"]["acceptance"]["if"] == (
+        "github.event_name != 'pull_request' || github.event.pull_request.merged == true"
+    )
 
 
-def test_pull_requests_and_main_pushes_run_read_only_acceptance_without_publish():
-    candidates = [config for config in workflows().values() if {"pull_request", "push"} <= config["on"].keys()]
-    assert candidates, "no PR/main acceptance workflow is configured"
-    for config in candidates:
-        assert not config["on"]["pull_request"], "fork and same-repository PRs must remain unfiltered"
-        assert "workflow_call" in config["on"], "release builds must retain reusable acceptance"
-        assert config["permissions"] == {"contents": "read"}
-        assert config["concurrency"]["cancel-in-progress"] == "true"
-        assert "github.ref" in config["concurrency"]["group"]
-        for job in config["jobs"].values():
-            assert "if" not in job, "acceptance must not skip fork PR jobs"
-            assert "environment" not in job
-            assert "permissions" not in job
-            for step in job.get("steps", []):
-                assert not step.get("uses", "").startswith("pypa/gh-action-pypi-publish@")
+def test_acceptance_uses_supported_runner_matrix():
+    matrix = workflows()["acceptance.yml"]["jobs"]["acceptance"]["strategy"]["matrix"]
+    assert matrix == {"os": ["ubuntu-latest", "macos-15"], "python-version": ["3.10", "3.11", "3.12"]}
+
+
+def test_acceptance_remains_read_only_and_cannot_publish():
+    config = workflows()["acceptance.yml"]
+    assert config["permissions"] == {"contents": "read"}
+    assert config["concurrency"]["cancel-in-progress"] == "true"
+    assert "github.ref" in config["concurrency"]["group"]
+    for job in config["jobs"].values():
+        assert "environment" not in job
+        assert "permissions" not in job
+        for step in job.get("steps", []):
+            assert not step.get("uses", "").startswith("pypa/gh-action-pypi-publish@")
 
 
 def test_release_build_requires_version_preflight_and_publish_requires_success():
@@ -424,8 +410,8 @@ def test_release_evidence_is_not_downloaded_as_a_publishable_package():
         if step.get("uses", "").startswith("actions/upload-artifact@")
     ]
     assert len(upload_names) == 2
-    assert fnmatch.fnmatch("wheels-macos-14-3.10", download["pattern"])
-    assert not fnmatch.fnmatch("wheel-evidence-macos-14-3.10", download["pattern"])
+    assert fnmatch.fnmatch("wheels-macos-15-3.10", download["pattern"])
+    assert not fnmatch.fnmatch("wheel-evidence-macos-15-3.10", download["pattern"])
 
 
 def test_native_pytest_recipe_ignores_ancestor_repository_configuration(tmp_path):
